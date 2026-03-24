@@ -1,125 +1,109 @@
 """
-Executor — Exécute les actions d'un plan une par une.
-Utilise le LLM local de Micheline.
+Executor — Exécute les actions planifiées.
+Emplacement : micheline/core/executor.py
+FICHIER MODIFIÉ — Phase 5
 """
 
-from datetime import datetime
-
-
-class ActionResult:
-    """Résultat d'une action exécutée."""
-
-    def __init__(self, action: str, success: bool, output: str, error: str = None):
-        self.action = action
-        self.success = success
-        self.output = output
-        self.error = error
-        self.timestamp = datetime.now().isoformat()
-
-    def to_dict(self):
-        return {
-            "action": self.action,
-            "success": self.success,
-            "output": self.output,
-            "error": self.error,
-            "timestamp": self.timestamp
-        }
-
-    def __str__(self):
-        status = "✅" if self.success else "❌"
-        return f"{status} [{self.action}] {self.output[:200]}"
+import traceback
+from typing import Dict, Any
+from micheline.tools.registry import tool_registry
 
 
 class Executor:
-    """
-    Exécute les étapes d'un plan.
-    Phase 1: actions de base (respond, think)
-    Phase 2+: délègue au tool registry
-    """
-
-    def __init__(self, llm_client=None, tool_registry=None):
-        self.llm_client = llm_client
-        self.tool_registry = tool_registry
-
-        self._builtin_actions = {
-            "respond": self._action_respond,
-            "think": self._action_think,
-        }
-
-    def execute_step(self, step: dict) -> ActionResult:
-        action_name = step.get("action", "respond")
-        params = step.get("params", {})
-
+    """Exécute les actions définies par le Planner."""
+    
+    def execute(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Exécute un plan d'action.
+        
+        Args:
+            plan: Dictionnaire avec 'tool', 'params', et optionnellement 'reasoning'
+        
+        Returns:
+            {
+                "success": bool,
+                "tool_used": str,
+                "result": str,
+                "error": str | None
+            }
+        """
+        tool_name = plan.get("tool", "conversation")
+        params = plan.get("params", {})
+        
+        # Cas spécial : conversation (pas d'outil à exécuter)
+        if tool_name == "conversation":
+            return {
+                "success": True,
+                "tool_used": "conversation",
+                "result": params.get("response", "Je n'ai pas de réponse."),
+                "error": None
+            }
+        
+        # Vérifier que l'outil existe
+        tool_info = tool_registry.get_tool_info(tool_name)
+        if not tool_info:
+            # Essayer avec des variantes de nom
+            name_variants = {
+                "search": "web_search",
+                "web": "web_search",
+                "execute_code": "code_executor",
+                "run_code": "code_executor",
+                "python": "code_executor",
+                "shell": "shell_command",
+                "cmd": "shell_command",
+                "terminal": "shell_command",
+                "mt5": "mt5_tool",
+                "metatrader": "mt5_tool",
+                "trading": "mt5_tool",
+                "plan": "task_planner",
+                "planner": "task_planner",
+                "decompose": "task_planner",
+                "calc": "calculator",
+                "math": "calculator",
+                "time": "datetime",
+                "date": "datetime",
+                "memory": "memory_search",
+                "remember": "memory_search",
+                "ls": "list_directory",
+                "dir": "list_directory",
+                "cat": "read_file",
+                "read": "read_file",
+                "write": "write_file",
+                "save": "write_file",
+                "sysinfo": "system_info",
+            }
+            
+            resolved_name = name_variants.get(tool_name.lower())
+            if resolved_name and tool_registry.get_tool_info(resolved_name):
+                tool_name = resolved_name
+            else:
+                return {
+                    "success": False,
+                    "tool_used": tool_name,
+                    "result": None,
+                    "error": f"Outil inconnu : '{tool_name}'. Disponibles : {', '.join(sorted(tool_registry.tools.keys()))}"
+                }
+        
+        # Exécuter l'outil
         try:
-            # 1. Actions internes
-            if action_name in self._builtin_actions:
-                output = self._builtin_actions[action_name](params)
-                return ActionResult(action=action_name, success=True, output=output)
-
-            # 2. Tool registry (Phase 2)
-            if self.tool_registry:
-                output = self.tool_registry.execute(action_name, params)
-                return ActionResult(action=action_name, success=True, output=str(output))
-
-            # 3. Action inconnue
-            return ActionResult(
-                action=action_name, success=False, output="",
-                error=f"Action inconnue: {action_name}. Disponibles: {list(self._builtin_actions.keys())}"
-            )
-
+            result = tool_registry.execute(tool_name, params)
+            
+            return {
+                "success": True,
+                "tool_used": tool_name,
+                "result": result,
+                "error": None
+            }
+        
         except Exception as e:
-            return ActionResult(action=action_name, success=False, output="", error=f"Erreur: {str(e)}")
+            error_detail = traceback.format_exc()
+            return {
+                "success": False,
+                "tool_used": tool_name,
+                "result": None,
+                "error": f"{type(e).__name__}: {e}\n{error_detail}"
+            }
 
-    def _action_respond(self, params: dict) -> str:
-        """Génère une réponse via le LLM local."""
-        message = params.get("message", "")
 
-        if self.llm_client and message:
-            try:
-                if hasattr(self.llm_client, 'chat') and callable(self.llm_client.chat):
-                    answer, dt, usage = self.llm_client.chat(
-                        messages=[{"role": "user", "content": message}],
-                        system_prompt="Tu es Micheline, une IA locale. Réponds de manière utile et concise.",
-                        temperature=0.3,
-                        max_tokens=1500
-                    )
-                    return answer or message
-            except Exception as e:
-                return f"Erreur LLM: {str(e)}"
-
-        return message if message else "Aucun message à transmettre."
-
-    def _action_think(self, params: dict) -> str:
-        """Réfléchit/analyse via le LLM local."""
-        topic = params.get("topic", params.get("message", ""))
-
-        think_prompt = f"""Analyse cette situation en profondeur.
-Donne ton raisonnement étape par étape.
-
-Sujet: {topic}
-
-Réponds avec:
-1. Analyse du problème
-2. Options possibles
-3. Recommandation"""
-
-        if self.llm_client:
-            try:
-                if hasattr(self.llm_client, 'chat') and callable(self.llm_client.chat):
-                    answer, dt, usage = self.llm_client.chat(
-                        messages=[{"role": "user", "content": think_prompt}],
-                        system_prompt="Tu es un analyste expert. Raisonne étape par étape.",
-                        temperature=0.2,
-                        max_tokens=1500
-                    )
-                    return answer or f"Réflexion sur: {topic}"
-            except Exception as e:
-                return f"Erreur réflexion: {str(e)}"
-
-        return f"Réflexion sur: {topic} (LLM non disponible)"
-
-    def get_available_actions(self) -> list:
-        actions = list(self._builtin_actions.keys())
-        if self.tool_registry:
-            actions.extend(self.tool_registry.list_tools())
-        return actions
+# Instance globale
+executor = Executor()
