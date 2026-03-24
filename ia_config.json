@@ -1,0 +1,255 @@
+{
+    "mql5_files_path": "C:\\Users\\Dragonus\\AppData\\Roaming\\MetaQuotes\\Terminal\\FE0E65DDB0B7B40DE125080872C34D61\\MQL5\\Files",
+    "watcher_service_enabled": true,
+    "training_frequency_days": 3000,
+    "initial_training_years": 1,
+    "update_training_months": 6,
+    "prediction_horizon": "D1",
+    "sl_timeframe": "H4",
+    "tp_timeframe": "D1",
+    "auto_optimize_horizon_sl_tp": true,
+    "selected_pairs": [
+        "EURUSD"
+    ],
+    "tradable_pairs": [],
+    "active_feature_groups": [
+        "Moyennes Mobiles",
+        "Choppiness",
+        "RSI",
+        "Points Pivots",
+        "Bandes de Bollinger",
+        "Ichimoku Kinko Hyo"
+    ],
+    "optimized_feature_configs": {},
+    "model_performances": {
+        "EURUSD": {
+            "last_update": "2025-10-02",
+            "num_features": 40,
+            "last_training": "2025-10-02",
+            "meta_accuracy": 51.407283544540405,
+            "last_meta_training": "2025-10-02",
+            "stacked": true
+        }
+    },
+    "training_progress": {
+        "EURUSD": {
+            "last_chunk_completed": 1
+        }
+    },
+    "use_automatic_feature_selection": false,
+    "optimal_sl_tp_multipliers": {
+        "EURUSD": {
+            "sl": 4.0,
+            "tp": 4.0
+        }
+    },
+    "use_ensemble_learning": true,
+    "use_multi_timeframe": true,
+    "use_stacked_model": true,
+    "run_on_startup": {},
+    "trend_filter_enabled": true,
+    "trend_filter_timeframe": "D1",
+    "trend_filter_ma_period": 200,
+    "trend_filter_bars_min": 500,
+    "trend_filter_bars_margin": 50,
+    "trend_filter_verbose": true,
+    "trend_filter_anchor": "prev",
+    "trend_min_distance_atr": 0.0,
+    "countertrend_enable": false,
+    "countertrend_distance_atr": 1.2,
+    "decision_conf_threshold_pct": 20.0,
+    "confidence_threshold": 0.55,
+    "backtest_spread_points": 0,
+    "backtest_commission_pips": 0.0,
+    "stt_enabled": true,
+    "stt_backend": "vosk",
+    "stt_sample_rate": 16000,
+    "stt_vad_silence_ms": 800,
+    "stt_device": "",
+    "tts_enabled": true,
+    "tts_backend": "piper",
+    "tts_auto_read": false,
+    "piper_voice_path": "micheline/models/tts/piper/voices/fr/fr_FR-mls_5809-medium.onnx",
+    "piper_config_path": "micheline/models/tts/piper/voices/fr/fr_FR-mls_5809-medium.onnx.json",
+    "piper_length_scale": 1.0,
+    "piper_noise": 0.667,
+    "piper_noise_w": 0.8,
+    "piper_speaker_id": 0,
+    "tts_rate": 175,
+    "tts_volume": 1.0,
+    "tts_voice_hint": "female:fr",
+    "rag_enabled": true,
+    "rag_embedding_model_dir": "micheline/models/embeddings/all-MiniLM-L6-v2",
+    "rag_faiss_index_path": "micheline/rag/index/faiss/knowledge.faiss",
+    "rag_chunk_size": 1000,
+    "rag_chunk_overlap": 150,
+    "rag_top_k": 5,
+    "rag_http_timeout": 20,
+    "rag_http_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "rag_include_tables": true,
+    "rag_text_exts": [
+        ".txt",
+        ".md",
+        ".py",
+        ".json",
+        ".js",
+        ".html",
+        ".css"
+    ],
+    "always_check_web": true,
+    "news_recent_days": 30,
+    "news_max_articles": 8,
+    "news_language": "fr",
+    "news_sort_by": "publishedAt",
+    "llm_chat_temperature": 0.25,
+    "llm_chat_top_p": 0.95,
+    "llm_chat_max_tokens": 900,
+    "llm_model_dir": "micheline/models/llm",
+    "llm_default_gguf": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+    "ram_limit_percent": 75,
+    "ram_warn_percent": 65,
+    "llm_auto_unload_sec": 300,
+    "llm_use_mmap": true,
+    "llm_use_mlock": false,
+    "llm_max_n_ctx_auto": true,
+    "llm_n_ctx_min": 2048,
+    "vlm_model": "llava:13b",
+    "vlm_host": "http://127.0.0.1:11434",
+    "vlm_timeout": 180,
+    "use_vlm_always": false,
+    "ocr_backend_pref": "auto",
+    "ocr_lang_primary": "fr",
+    "ocr_max_chars": 12000,
+    "ocr_image_max_width": 2800,
+    "ui_show_history_on_start": 2,
+    "ui_max_chat_rows": 999999999999,
+    "worker_task_file": "tasks.json",
+    "worker_status_file": "worker_status.json",
+    "worker_poll_interval_sec": 2.0,
+    "worker_task_timeout_sec": 0,
+    "mql5_poll_interval_sec": 0.1,
+    "analyzer_tp_window_bars": 24,
+    "risk_trend_ma_min_dist_atr": 0.3,
+    "risk_round_dist_pips_max": 10.0,
+    "risk_extension_pvmaf_max": 1.8,
+    "risk_low_margin_pct_min": 6.0,
+    "risk_diverge_low_margin_pct_min": 12.0,
+    "optimizer_top_n_candidates": 5,
+    "optimizer_horizons_to_test": [
+        "H1",
+        "H4",
+        "D1"
+    ],
+    "optimizer_sl_tp_timeframes_to_test": [
+        "H1",
+        "H4",
+        "D1"
+    ],
+    "optimizer_sl_grid": [
+        0.5,
+        1.0,
+        1.5,
+        2.0
+    ],
+    "optimizer_tp_grid": [
+        1.0,
+        2.0,
+        3.0,
+        4.0
+    ],
+    "sl_tp_pred_batch_size": 5000,
+    "csv_delimiter": ";",
+    "preferred_tester_agent": "Agent-127.0.0.1-3000",
+    "allowed_roots": [
+        "C:\\\\"
+    ],
+    "allow_write_outside": true,
+    "allowed_write_exts": [
+        ".py",
+        ".md",
+        ".txt",
+        ".json",
+        ".yml",
+        ".yaml",
+        ".ini",
+        ".toml",
+        ".csv",
+        ".cfg"
+    ],
+    "max_patch_kb": 256,
+    "audit_log_path": "micheline/logs/audit.jsonl",
+    "test_commands": [
+        "python -m pytest -q"
+    ],
+    "sandbox_run_tests_sec": 300,
+    "quality_enabled": true,
+    "quality_skip_missing": true,
+    "quality_require_green": true,
+    "quality_apply_format": false,
+    "quality_timeout_sec": 240,
+    "quality_check_commands": [
+        "ruff .",
+        "black --check .",
+        "isort --check-only .",
+        "mypy .",
+        "pydocstyle .",
+        "bandit -q -r ."
+    ],
+    "quality_format_commands": [
+        "isort .",
+        "black .",
+        "ruff --fix ."
+    ],
+    "patch_run_tests": false,
+    "git_enabled": false,
+    "git_repo_root": "",
+    "TTS_BACKEND": "piper",
+    "PIPER_VOICE_PATH": "micheline\\models\\tts\\piper\\voices\\fr_FR-siwis-low.onnx",
+    "PIPER_CONFIG_PATH": "micheline\\models\\tts\\piper\\voices\\fr_FR-siwis-low.onnx.json",
+    "prediction_timeframe": "H1",
+    "rag_last_done_date": "2026-03-23",
+    "full_optimization_status": {
+        "EURUSD": {
+            "last_run": "2025-10-02",
+            "best_overall": {
+                "prediction_horizon": "D1",
+                "sl_timeframe": "H4",
+                "tp_timeframe": "D1",
+                "sl_multiplier": 0.5,
+                "tp_multiplier": 4.0,
+                "profit": 600.7749171102403
+            },
+            "best_per_horizon": {
+                "H1": {
+                    "prediction_horizon": "H1",
+                    "sl_timeframe": "H4",
+                    "tp_timeframe": "D1",
+                    "sl_multiplier": 2.0,
+                    "tp_multiplier": 4.0,
+                    "profit": 181.2985250270481
+                },
+                "H4": {
+                    "prediction_horizon": "H4",
+                    "sl_timeframe": "H4",
+                    "tp_timeframe": "D1",
+                    "sl_multiplier": 0.5,
+                    "tp_multiplier": 4.0,
+                    "profit": 436.28094355244
+                },
+                "D1": {
+                    "prediction_horizon": "D1",
+                    "sl_timeframe": "H4",
+                    "tp_timeframe": "D1",
+                    "sl_multiplier": 0.5,
+                    "tp_multiplier": 4.0,
+                    "profit": 600.7749171102403
+                }
+            }
+        }
+    },
+    "learning_last_done_date": "2025-09-28",
+    "TTS_AUTO_READ": true,
+    "adapter_active_name": "v20251002_1251",
+    "learning_sft_count_last_adapter": 8,
+    "auto_feature_selection_enabled": false
+}
