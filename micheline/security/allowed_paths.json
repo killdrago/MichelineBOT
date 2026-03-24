@@ -1,0 +1,24 @@
+{
+    "_comment": "CE FICHIER N EST JAMAIS ACCESSIBLE PAR L IA",
+    "allowed_paths": [
+        "C:\\Users\\Dragonus\\Desktop\\IA micheline"
+    ],
+    "allowed_extensions_read": [
+        ".txt", ".csv", ".json", ".yaml", ".yml", ".md",
+        ".py", ".log", ".ini", ".cfg", ".xml", ".html"
+    ],
+    "allowed_extensions_write": [
+        ".txt", ".csv", ".json", ".yaml", ".yml", ".md", ".log"
+    ],
+    "blocked_patterns": [
+        "security",
+        "allowed_paths.json",
+        "__pycache__",
+        ".git",
+        ".env",
+        "passwords",
+        "credentials",
+        "secrets"
+    ],
+    "max_file_size_mb": 50
+}

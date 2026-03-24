@@ -1,0 +1,1 @@
+# Package memory - Mémoire persistante agent Micheline

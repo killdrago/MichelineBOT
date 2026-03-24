@@ -1,0 +1,9 @@
+{
+  "military_escalation": 1,
+  "unknown": 1,
+  "macro_data": 1,
+  "shipping_accident": 1,
+  "commodity_supply": 1,
+  "market_move": 1,
+  "person_death": -1
+}
