@@ -1,255 +1,140 @@
-"""
-Agent Loop — Le cœur de Micheline v3.
-Boucle autonome: Objectif → Plan → Exécution → Évaluation → Boucle
+# À AJOUTER dans core/agent_loop.py
+# ──────────────────────────────────────────────
+# Nouvelles capacités trading pour l'agent
+# ──────────────────────────────────────────────
 
-C'est CE fichier qui est appelé depuis ton onglet Interaction.
-"""
-
-import time
-from datetime import datetime
-from typing import Callable, Optional
-
-from .planner import Planner, Plan
-from .executor import Executor, ActionResult
-from .evaluator import Evaluator, Evaluation
-
-# Mémoire persistante (Phase 4)
-try:
-    from micheline.memory.memory import AgentMemory
-    MEMORY_AVAILABLE = True
-except ImportError:
-    MEMORY_AVAILABLE = False
-    AgentMemory = None
-
-
-class AgentState:
-    """État courant de l'agent."""
-
-    def __init__(self):
-        self.objective = ""
-        self.current_plan = None
-        self.history = []  # Liste de {"step", "result", "timestamp"}
-        self.iteration = 0
-        self.max_iterations = 10  # Sécurité anti-boucle infinie
-        self.status = "idle"  # idle, thinking, executing, evaluating, complete, error
-        self.final_output = ""
-
-    def reset(self, objective: str):
-        self.objective = objective
-        self.current_plan = None
-        self.history = []
-        self.iteration = 0
-        self.status = "thinking"
-        self.final_output = ""
-
-
-class AgentLoop:
+def handle_trading_objective(objective: str) -> dict:
     """
-    Boucle agent autonome.
+    Traite un objectif lié au trading.
+    Appelé par la boucle principale quand l'objectif concerne le trading.
 
-    Usage depuis ton onglet Interaction:
-        agent = AgentLoop(llm_client=ton_client)
-        result = agent.run("Trouve une stratégie rentable sur EURUSD")
+    Args:
+        objective: description de l'objectif
+
+    Returns:
+        résultat de l'action trading
     """
+    from tools.registry import execute_tool
 
-    def __init__(self, llm_client=None, tool_registry=None, on_update: Callable = None):
-        self.planner = Planner(llm_client=llm_client)
-        self.executor = Executor(llm_client=llm_client, tool_registry=tool_registry)
-        self.evaluator = Evaluator(llm_client=llm_client)
+    objective_lower = objective.lower()
 
-        self.state = AgentState()
-        self.on_update = on_update or (lambda msg, state: None)
-        self.llm_client = llm_client
+    # Recherche de stratégie
+    if any(word in objective_lower for word in ["cherche", "search", "trouve", "find", "optimise"]):
+        params = _extract_trading_params(objective)
+        result = execute_tool("trading_search", params)
+        return {
+            "action": "trading_search",
+            "result": result,
+            "summary": _summarize_trading_result(result),
+        }
 
-        # === Phase 4: Mémoire persistante ===
-        self.memory = None
-        if MEMORY_AVAILABLE:
-            try:
-                self.memory = AgentMemory()
-            except Exception as e:
-                print(f"[AgentLoop] Mémoire non disponible: {e}")
-        """
-        Args:
-            llm_client: ton client LLM existant (Claude/OpenAI)
-            tool_registry: registre des outils (Phase 2, None pour l'instant)
-            on_update: callback appelé à chaque étape pour mettre à jour l'UI
-                       signature: on_update(message: str, state: AgentState)
-        """
-        self.planner = Planner(llm_client=llm_client)
-        self.executor = Executor(llm_client=llm_client, tool_registry=tool_registry)
-        self.evaluator = Evaluator(llm_client=llm_client)
+    # Test rapide
+    elif any(word in objective_lower for word in ["test", "quick", "rapide", "essai"]):
+        count = _extract_count(objective, default=5)
+        result = execute_tool("trading_quick_test", {"count": count})
+        return {
+            "action": "trading_quick_test",
+            "result": result,
+            "summary": f"Test rapide : {result.get('viable', 0)}/{result.get('tested', 0)} viables",
+        }
 
-        self.state = AgentState()
-        self.on_update = on_update or (lambda msg, state: None)
-        self.llm_client = llm_client
+    # Rapport
+    elif any(word in objective_lower for word in ["rapport", "report", "résumé", "summary", "status"]):
+        result = execute_tool("trading_report")
+        return {
+            "action": "trading_report",
+            "result": result,
+        }
 
-    def run(self, objective: str) -> str:
-        """
-        Point d'entrée principal. Appelé depuis l'onglet Interaction.
+    # Top stratégies
+    elif any(word in objective_lower for word in ["top", "meilleur", "best", "classement"]):
+        count = _extract_count(objective, default=5)
+        result = execute_tool("trading_top_strategies", {"count": count})
+        return {
+            "action": "trading_top_strategies",
+            "result": result,
+        }
 
-        Args:
-            objective: la demande de l'utilisateur (texte brut)
+    # Par défaut : recherche standard
+    else:
+        result = execute_tool("trading_search")
+        return {
+            "action": "trading_search",
+            "result": result,
+            "summary": _summarize_trading_result(result),
+        }
 
-        Returns:
-            str: la réponse finale à afficher
-        """
-        self.state.reset(objective)
-        self._emit(f"🎯 Objectif reçu: {objective}")
 
-        try:
-            while self.state.iteration < self.state.max_iterations:
-                self.state.iteration += 1
-                self._emit(f"\n{'='*50}")
-                self._emit(f"🔄 Itération {self.state.iteration}/{self.state.max_iterations}")
+def _extract_trading_params(objective: str) -> dict:
+    """Extrait les paramètres de trading depuis l'objectif textuel."""
+    import re
 
-                # === ÉTAPE 1: PLANIFIER ===
-                self.state.status = "thinking"
-                self._emit("🧠 Réflexion et planification...")
+    params = {}
 
-                context = self._build_context()
-                available_tools = self.executor.get_available_actions()
+    # Chercher un symbole
+    symbols = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "US500"]
+    for symbol in symbols:
+        if symbol.lower() in objective.lower():
+            params["symbols"] = [symbol]
+            break
 
-                plan = self.planner.create_plan(
-                    objective=objective,
-                    context=context,
-                    available_tools=available_tools
-                )
-                self.state.current_plan = plan
-                self._emit(str(plan))
+    # Chercher un timeframe
+    timeframes = {"m1": "M1", "m5": "M5", "m15": "M15", "m30": "M30",
+                  "h1": "H1", "h4": "H4", "d1": "D1"}
+    for key, value in timeframes.items():
+        if key in objective.lower():
+            params["timeframes"] = [value]
+            break
 
-                # === ÉTAPE 2: EXÉCUTER ===
-                self.state.status = "executing"
-                results = []
+    # Chercher un nombre de générations
+    gen_match = re.search(r'(\d+)\s*(?:gen|génération|generation|iter)', objective.lower())
+    if gen_match:
+        params["max_generations"] = int(gen_match.group(1))
 
-                while not plan.is_complete():
-                    step = plan.next_step()
-                    if step is None:
-                        break
+    # Chercher population size
+    pop_match = re.search(r'(\d+)\s*(?:pop|population|strat)', objective.lower())
+    if pop_match:
+        params["population_size"] = int(pop_match.group(1))
 
-                    self._emit(f"⚡ Exécution: {step.get('description', step.get('action', '?'))}")
-                    result = self.executor.execute_step(step)
-                    results.append(result)
+    return params
 
-                    self.state.history.append({
-                        "iteration": self.state.iteration,
-                        "step": step,
-                        "result": result.to_dict(),
-                        "timestamp": datetime.now().isoformat()
-                    })
 
-                    self._emit(str(result))
+def _extract_count(objective: str, default: int = 5) -> int:
+    """Extrait un nombre depuis l'objectif."""
+    import re
+    match = re.search(r'(\d+)', objective)
+    return int(match.group(1)) if match else default
 
-                    # === Phase 4: Stocker en mémoire persistante ===
-                    if self.memory:
-                        try:
-                            self.memory.store_experience(
-                                objective=objective,
-                                action=result.action,
-                                params=step.get("params", {}),
-                                result=result.output[:2000] if result.output else "",
-                                success=result.success,
-                                notes=result.error if not result.success else None
-                            )
-                        except Exception as e:
-                            print(f"[AgentLoop] Erreur stockage mémoire: {e}")
-                            
-                    # Si erreur critique, on arrête cette itération
-                    if not result.success:
-                        self._emit(f"⚠️ Erreur: {result.error}")
-                        break
 
-                # === ÉTAPE 3: ÉVALUER ===
-                self.state.status = "evaluating"
-                self._emit("📊 Évaluation des résultats...")
+def _summarize_trading_result(result: dict) -> str:
+    """Crée un résumé lisible du résultat trading."""
+    if "error" in result:
+        return f"Erreur : {result['error']}"
 
-                evaluation = self.evaluator.evaluate(objective, results)
-                self._emit(str(evaluation))
+    best_score = result.get("best_score", 0)
+    tested = result.get("total_strategies_tested", 0)
+    gens = result.get("generations_run", 0)
 
-                # === DÉCISION ===
-                if evaluation.is_complete:
-                    self.state.status = "complete"
-                    self.state.final_output = self._compile_final_output(results)
-                    self._emit(f"\n✅ Objectif atteint! (satisfaction: {evaluation.satisfaction:.0%})")
-                    return self.state.final_output
+    best = result.get("best_strategy", {})
+    best_id = best.get("id", "?") if best else "?"
+    symbol = best.get("symbol", "?") if best else "?"
 
-                elif evaluation.next_action == "abort":
-                    self.state.status = "error"
-                    self._emit("🛑 Abandon: objectif jugé impossible.")
-                    return f"❌ Impossible d'atteindre l'objectif: {evaluation.summary}"
+    metrics = result.get("best_metrics", {})
+    profit = metrics.get("profit", 0)
+    winrate = metrics.get("winrate", 0)
 
-                elif evaluation.next_action in ("retry", "modify_plan", "continue"):
-                    self._emit(f"🔄 {evaluation.next_action}: on continue...")
-                    # La boucle continue avec le contexte enrichi
-                    continue
+    return (
+        f"Recherche terminée : {tested} stratégies testées en {gens} générations. "
+        f"Meilleure : {best_id} ({symbol}) — "
+        f"Score: {best_score:.1f}, Profit: {profit:.2f}$, Winrate: {winrate:.1f}%"
+    )
 
-                else:
-                    # Par défaut, si évaluation ambiguë, on considère terminé
-                    self.state.status = "complete"
-                    self.state.final_output = self._compile_final_output(results)
-                    return self.state.final_output
 
-            # Max itérations atteint
-            self.state.status = "error"
-            self._emit(f"⚠️ Maximum d'itérations atteint ({self.state.max_iterations})")
-            return self._compile_final_output(
-                [r for h in self.state.history for r in [ActionResult(**h["result"])] if True]
-            ) or "⚠️ Nombre maximum d'itérations atteint sans résolution complète."
-
-        except Exception as e:
-            self.state.status = "error"
-            error_msg = f"❌ Erreur agent: {str(e)}"
-            self._emit(error_msg)
-            return error_msg
-
-    def _build_context(self) -> str:
-        """Construit le contexte à partir de l'historique + mémoire persistante."""
-        parts = []
-
-        # Contexte de la session en cours
-        if self.state.history:
-            parts.append("=== Session en cours ===")
-            for entry in self.state.history[-5:]:
-                result = entry["result"]
-                status = "OK" if result["success"] else "ERREUR"
-                parts.append(
-                    f"[Iter {entry['iteration']}] {result['action']}: {status} — {result['output'][:200]}"
-                )
-
-        # Contexte de la mémoire persistante (Phase 4)
-        if self.memory:
-            try:
-                mem_context = self.memory.get_context_summary(max_items=5)
-                if mem_context and mem_context != "Aucune mémoire enregistrée.":
-                    parts.append("\n" + mem_context)
-            except Exception as e:
-                print(f"[AgentLoop] Erreur lecture mémoire: {e}")
-
-        return "\n".join(parts) if parts else ""
-        
-    def _compile_final_output(self, results: list) -> str:
-        """Compile la sortie finale à partir des résultats."""
-        # Prendre la dernière réponse réussie
-        for result in reversed(results):
-            if isinstance(result, ActionResult):
-                if result.success and result.output:
-                    return result.output
-            elif isinstance(result, dict):
-                if result.get("success") and result.get("output"):
-                    return result["output"]
-
-        return "Traitement terminé mais aucun résultat concret obtenu."
-
-    def _emit(self, message: str):
-        """Envoie un message de mise à jour."""
-        self.on_update(message, self.state)
-
-    # === MÉTHODE SIMPLE POUR QUESTIONS DIRECTES ===
-    def quick_respond(self, message: str) -> str:
-        """
-        Point d'entrée depuis le bridge.
-        Comme le routing agent/conversation est déjà fait dans main.py,
-        ici on lance TOUJOURS la boucle agent complète.
-        """
-        # Toujours utiliser la boucle agent complète
-        # (la détection simple/complexe est déjà faite dans main.py)
-        return self.run(message)
+def is_trading_objective(objective: str) -> bool:
+    """Détermine si l'objectif concerne le trading."""
+    trading_keywords = [
+        "trading", "trade", "stratégie", "strategy", "backtest",
+        "forex", "mt5", "metatrader", "optimis", "profit",
+        "eurusd", "gbpusd", "xauusd", "bourse", "marché",
+    ]
+    return any(kw in objective.lower() for kw in trading_keywords)
