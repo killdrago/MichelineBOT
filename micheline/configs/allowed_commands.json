@@ -1,9 +1,11 @@
 {
   "allowed_commands": [
+    "calc",
     "cat",
     "date",
     "dir",
     "echo",
+    "explorer",
     "find",
     "findstr",
     "git",
@@ -11,10 +13,13 @@
     "hostname",
     "ipconfig",
     "ls",
+    "mspaint",
+    "notepad",
     "ping",
     "pip",
     "pwd",
     "python",
+    "start",
     "systeminfo",
     "tasklist",
     "time",
@@ -30,7 +35,7 @@
     "cmd.exe",
     "del ",
     "fdisk",
-    "format",
+    "format ",
     "icacls",
     "mklink",
     "net localgroup",
@@ -47,5 +52,5 @@
     "| del",
     "| rm"
   ],
-  "_comment": "Ce fichier contrôle les commandes shell autorisées. NE PAS donner accès à l'IA."
+  "_comment": "NE PAS donner acces a IA"
 }

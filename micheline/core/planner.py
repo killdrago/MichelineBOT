@@ -1,16 +1,24 @@
 """
-Planner — Planifie les actions de l'agent.
-Emplacement : micheline/core/planner.py
-FICHIER MODIFIÉ — Phase 5 + Phase 6 (Trading Engine + Multi-actions)
+micheline/core/planner.py
+
+Planificateur intelligent avec :
+- Détection multi-actions (split "et/puis/ensuite")
+- Détection trading avancée
+- Détection app_launcher (ouvre paint, notepad, etc.)
+- Gestion des échecs et fallbacks
+- Attributs llm_client et set_tools_description() pour main.py
 """
 
 import json
 import re
-from typing import Dict, Any, Optional, List
+import logging
+import unicodedata
+from typing import Dict, Any, List, Optional
+
+logger = logging.getLogger("micheline.planner")
 
 
 class Planner:
-    """Planifie les actions en fonction de l'objectif et de la réponse du LLM."""
 
     TOOL_PATTERNS = {
         "calculator": [
@@ -111,68 +119,180 @@ class Planner:
         ],
     }
 
-    def create_plan(self, objective: str, llm_response: str) -> Dict[str, Any]:
-        plan = self._try_parse_json(llm_response)
-        if plan:
-            plan["fallback_used"] = False
-            return plan
+    def __init__(self, available_tools: List[str] = None):
+        self.available_tools = available_tools or []
+        self.failure_history: List[Dict[str, Any]] = []
+        self.attempt_count: Dict[str, int] = {}
 
-        plan = self._detect_tool_from_text(objective, llm_response)
-        plan["fallback_used"] = True
-        return plan
+        # Attributs attendus par main.py
+        self.llm_client = None
+        self._tools_description: str = ""
 
-    def _try_parse_json(self, text: str) -> Optional[Dict]:
-        json_patterns = [
-            r'```json\s*(.*?)\s*```',
-            r'```\s*(.*?)\s*```',
-            r'\{[^{}]*"tool"[^{}]*\}',
-            r'\{[^{}]*"action"[^{}]*\}',
-        ]
+        logger.info(f"Planner initialisé avec {len(self.available_tools)} outils")
 
-        for pattern in json_patterns:
-            matches = re.findall(pattern, text, re.DOTALL)
-            for match in matches:
-                try:
-                    data = json.loads(match)
-                    if isinstance(data, dict):
-                        tool = data.get("tool") or data.get("action") or data.get("name")
-                        params = data.get("params") or data.get("parameters") or data.get("args") or {}
-                        if tool:
-                            return {
-                                "tool": tool,
-                                "params": params,
-                                "reasoning": data.get("reasoning", "Extrait du JSON LLM")
-                            }
-                except (json.JSONDecodeError, TypeError):
-                    continue
+    def set_tools_description(self, description: str):
+        """Appelé par main.py pour donner au planner la description des outils."""
+        self._tools_description = description or ""
 
-        return None
+    def update_tools(self, tools: List[str]):
+        self.available_tools = tools
 
-    def _detect_tool_from_text(self, objective: str, llm_response: str) -> Dict:
-        combined_text = f"{objective} {llm_response}".lower()
+    def record_failure(self, tool_name: str, params: dict = None, error: str = ""):
+        self.failure_history.append({"tool": tool_name, "params": params, "error": error})
+        self.attempt_count[tool_name] = self.attempt_count.get(tool_name, 0) + 1
+
+    def record_success(self, tool_name: str):
+        self.attempt_count[tool_name] = 0
+
+    def reset(self):
+        self.failure_history.clear()
+        self.attempt_count.clear()
+
+    # ═══════════════════════════════════════
+    # SPLIT MULTI-ACTIONS
+    # ═══════════════════════════════════════
+
+    def split_objectives(self, objective: str) -> List[str]:
+        """
+        Détecte si le message contient plusieurs actions distinctes.
+        Ex: "fait moi une stratégie EURUSD et ouvre moi paint"
+        → ["fait moi une stratégie EURUSD", "ouvre moi paint"]
+        """
+        text = objective.strip()
+
+        action_words = (
+            r'ouvr[ei]|lance|d[eé]marre|start|open'
+            r'|ferm[eé]|ferme'
+            r'|cherch[eé]|trouv[eé]|recherch'
+            r'|fais|fait'
+            r'|cr[eé]e|supprim'
+            r'|affich[eé]|montr[eé]'
+            r'|calcul[eé]'
+            r'|ex[eé]cute'
+            r'|connecte'
+            r'|teste'
+        )
+
+        split_pattern = (
+            rf'\s+(?:et|puis|ensuite|aussi|également)\s+'
+            rf'(?:(?:moi|le|la|les|l\'|un|une|des|du)\s+)*'
+            rf'(?={action_words})'
+        )
+
+        parts = re.split(split_pattern, text, flags=re.IGNORECASE)
+
+        cleaned = []
+        for p in parts:
+            p = p.strip().rstrip('.!?')
+            if len(p) > 3:
+                cleaned.append(p)
+
+        if len(cleaned) > 1:
+            logger.info(f"Multi-actions détectées: {cleaned}")
+            return cleaned
+
+        return [text]
+
+    # ═══════════════════════════════════════
+    # PLAN PRINCIPAL
+    # ═══════════════════════════════════════
+
+    def plan(self, objective: str, context: dict = None, llm=None) -> Dict[str, Any]:
+        """
+        Planifie l'action pour UN SEUL objectif (déjà splitté).
+        """
+        context = context or {}
         objective_lower = objective.lower()
 
-        # ═══════════════════════════════════════
-        # PRIORITÉ 0 : Trading Engine
-        # ═══════════════════════════════════════
+        def remove_accents(s):
+            try:
+                return "".join(
+                    c for c in unicodedata.normalize("NFD", s)
+                    if unicodedata.category(c) != "Mn"
+                )
+            except Exception:
+                return s
 
+        text_normalized = remove_accents(objective_lower)
+
+        # ═══════════════════════════════
+        # PRIORITÉ 0 : TRADING
+        # ═══════════════════════════════
         trading_result = self._detect_trading(objective_lower)
         if trading_result:
+            # Vérifier les échecs pour adapter
+            ts_failures = self.attempt_count.get("trading_search", 0)
+            tg_failures = self.attempt_count.get("trading_generate", 0)
+
+            tool = trading_result.get("tool", "trading_search")
+
+            if tool == "trading_search" and ts_failures >= 2 and tg_failures == 0:
+                return {
+                    "tool": "trading_generate",
+                    "params": trading_result.get("params", {}),
+                    "reasoning": f"Fallback trading_generate (trading_search échoué {ts_failures}x)",
+                    "fallback": "llm_direct"
+                }
+            elif tool == "trading_search" and ts_failures >= 1:
+                params = trading_result.get("params", {})
+                params["population_size"] = min(params.get("population_size", 10), 5)
+                params["max_generations"] = min(params.get("max_generations", 3), 1)
+                return {
+                    "tool": "trading_search",
+                    "params": params,
+                    "reasoning": "Retry trading_search avec params réduits",
+                    "fallback": "trading_generate"
+                }
+
+            trading_result["fallback"] = "trading_generate"
             return trading_result
 
-        # ═══════════════════════════════════════
-        # PRIORITÉ 1 : Détection directe
-        # ═══════════════════════════════════════
+        # ═══════════════════════════════
+        # PRIORITÉ 1 : APP LAUNCHER
+        # ═══════════════════════════════
+        open_match = re.search(
+            r'\b(ouvr[ei]|lance|d[eé]marre|start|open|démarre|demarre)\b'
+            r'[\s\-]*(moi\s+)?(le\s+|la\s+|l\')?(.+)',
+            objective_lower
+        )
+        if open_match:
+            raw_apps = open_match.group(4).strip()
 
-        # Suppression → BLOQUER
+            # Vérifier que ce n'est PAS du trading
+            trading_kw = [
+                "trading", "backtest", "stratégie", "strategie", "strat",
+                "forex", "bourse", "mt5", "metatrader", "optimis"
+            ]
+            is_trading = any(kw in raw_apps for kw in trading_kw)
+
+            if not is_trading:
+                raw_apps = re.sub(
+                    r'\s+(et|and|puis|also)\s+(le\s+|la\s+|l\')?',
+                    '|', raw_apps
+                )
+                app_names = [a.strip() for a in raw_apps.split('|') if a.strip()]
+                if app_names:
+                    return {
+                        "tool": "app_launcher",
+                        "params": {"app_names": app_names},
+                        "reasoning": f"Ouverture application(s): {', '.join(app_names)}",
+                        "fallback": None
+                    }
+
+        # ═══════════════════════════════
+        # PRIORITÉ 2 : SUPPRESSION → BLOQUER
+        # ═══════════════════════════════
         if re.search(r'\b(supprime|supprimer|efface|effacer|delete|remove|rm\s|del\s)\b', objective_lower):
             return {
                 "tool": "conversation",
                 "params": {"response": "🚫 Je ne suis pas autorisée à supprimer des fichiers."},
-                "reasoning": "Demande de suppression → refus"
+                "reasoning": "Demande de suppression → refus",
+                "fallback": None
             }
 
-        # Code Python explicite
+        # ═══════════════════════════════
+        # PRIORITÉ 3 : CODE PYTHON
+        # ═══════════════════════════════
         if re.search(r'(ex[eé]cute.*code|code\s*python|print\s*\(|def\s+\w+\s*\(|import\s+\w+)', objective_lower):
             code = objective
             code = re.sub(r'^.*?:\s*', '', code, count=1)
@@ -183,104 +303,98 @@ class Planner:
             return {
                 "tool": "code_executor",
                 "params": {"code": code.strip()},
-                "reasoning": "Code Python détecté"
+                "reasoning": "Code Python détecté",
+                "fallback": None
             }
 
-        # Ouvrir un logiciel
-        open_match = re.search(
-            r'\b(ouvr[ei]|lance|d[eé]marre|start|open|démarre|demarre)\b[\s\-]*(moi\s+)?(le\s+|la\s+|l\')?(.+)',
-            objective_lower
-        )
-        if open_match:
-            raw_apps = open_match.group(4).strip()
-            trading_keywords = [
-                "trading", "backtest", "stratégie", "strategie", "strat",
-                "forex", "bourse", "mt5", "metatrader", "optimis"
-            ]
-            is_trading_context = any(kw in raw_apps for kw in trading_keywords)
-
-            if not is_trading_context:
-                raw_apps = re.sub(r'\s+(et|and|puis|also)\s+(le\s+|la\s+|l\')?', '|', raw_apps)
-                app_names = [a.strip() for a in raw_apps.split('|') if a.strip()]
-                if app_names:
-                    return {
-                        "tool": "app_launcher",
-                        "params": {"app_names": app_names},
-                        "reasoning": f"Ouverture : {', '.join(app_names)}"
-                    }
-
-        # Ping / shell
+        # ═══════════════════════════════
+        # PRIORITÉ 4 : PING / SHELL
+        # ═══════════════════════════════
         if re.search(r'(ping\s+\S|ipconfig|systeminfo|tasklist|hostname|whoami)', objective_lower):
             cmd_match = re.search(r'(ping\s+[\w\.\-]+|ipconfig|systeminfo|tasklist|hostname|whoami)', objective_lower)
             command = cmd_match.group(0) if cmd_match else "echo commande non détectée"
             return {
                 "tool": "shell_command",
                 "params": {"command": command},
-                "reasoning": "Commande shell détectée"
+                "reasoning": "Commande shell détectée",
+                "fallback": None
             }
 
-        # MT5 connexion
-        if re.search(r'connect.*mt5|mt5.*connect|connecte.*mt5|connecte-toi.*mt5|metatrader.*connect', objective_lower):
+        # ═══════════════════════════════
+        # PRIORITÉ 5 : MT5
+        # ═══════════════════════════════
+        if re.search(r'connect.*mt5|mt5.*connect|connecte.*mt5|metatrader.*connect', objective_lower):
             return {
                 "tool": "mt5_tool",
                 "params": {"action": "connect"},
-                "reasoning": "Connexion MT5 demandée"
+                "reasoning": "Connexion MT5 demandée",
+                "fallback": None
             }
 
-        # Décomposition
-        if re.search(r'd[eé]compos|[eé]tape\s*par\s*[eé]tape|planifi.*action|fais.*plan|comment\s+proc[eé]der', objective_lower):
+        # ═══════════════════════════════
+        # PRIORITÉ 6 : DÉCOMPOSITION
+        # ═══════════════════════════════
+        if re.search(r'd[eé]compos|[eé]tape\s*par\s*[eé]tape|planifi.*action|fais.*plan', objective_lower):
             return {
                 "tool": "task_planner",
                 "params": {"problem": objective},
-                "reasoning": "Décomposition demandée"
+                "reasoning": "Décomposition demandée",
+                "fallback": None
             }
 
-        # Recherche web
-        if re.search(r'recherch.*sur|cherch.*info|wikipedia|actualit[eé]|news\s+sur|derni[eè]re.*nouvelle', objective_lower):
+        # ═══════════════════════════════
+        # PRIORITÉ 7 : RECHERCHE WEB
+        # ═══════════════════════════════
+        if re.search(r'recherch.*sur|cherch.*info|wikipedia|actualit|news\s+sur', objective_lower):
             query = objective
-            for word in ["recherche", "cherche", "trouve", "sur", "info", "information",
-                         "actualité", "news", "qu'est-ce que", "c'est quoi", "des", "les", "de", "du", "la", "le"]:
+            for word in ["recherche", "cherche", "trouve", "sur", "info",
+                         "actualité", "news", "qu'est-ce que", "c'est quoi"]:
                 query = re.sub(rf'\b{word}\b', '', query, flags=re.IGNORECASE)
-            query = re.sub(r'\s+', ' ', query).strip()
-            if not query:
-                query = objective
-            source = "all"
-            if re.search(r'wikipedia|wiki', objective_lower):
-                source = "wikipedia"
-            elif re.search(r'news|actualit|nouvelle', objective_lower):
-                source = "news"
+            query = re.sub(r'\s+', ' ', query).strip() or objective
             return {
                 "tool": "web_search",
-                "params": {"query": query, "source": source},
-                "reasoning": "Recherche web détectée"
+                "params": {"query": query},
+                "reasoning": "Recherche web détectée",
+                "fallback": "llm_direct"
             }
 
-        # ═══════════════════════════════════════
-        # PRIORITÉ 2 : Score par patterns
-        # ═══════════════════════════════════════
+        # ═══════════════════════════════
+        # PRIORITÉ 8 : SCORE PAR PATTERNS
+        # ═══════════════════════════════
+        combined_text = f"{objective}".lower()
         scores = {}
         for tool_name, patterns in self.TOOL_PATTERNS.items():
-            score = 0
-            for pattern in patterns:
-                if re.search(pattern, combined_text, re.IGNORECASE):
-                    score += 1
+            score = sum(1 for p in patterns if re.search(p, combined_text, re.IGNORECASE))
             if score > 0:
                 scores[tool_name] = score
 
-        if not scores:
+        if scores:
+            best_tool = max(scores, key=scores.get)
+            params = self._build_params(best_tool, objective)
             return {
-                "tool": "conversation",
-                "params": {"response": llm_response},
-                "reasoning": "Aucun outil détecté — conversation"
+                "tool": best_tool,
+                "params": params,
+                "reasoning": f"'{best_tool}' détecté (score: {scores[best_tool]})",
+                "fallback": None
             }
 
-        best_tool = max(scores, key=scores.get)
-        params = self._build_params(best_tool, objective, llm_response)
+        # ═══════════════════════════════
+        # FALLBACK : LLM DIRECT
+        # ═══════════════════════════════
+        effective_llm = llm or self.llm_client
+        if effective_llm:
+            return {
+                "tool": "llm_direct",
+                "params": {"prompt": objective},
+                "reasoning": "Aucun outil détecté → LLM direct",
+                "fallback": None
+            }
 
         return {
-            "tool": best_tool,
-            "params": params,
-            "reasoning": f"'{best_tool}' détecté (score: {scores[best_tool]})"
+            "tool": "none",
+            "params": {},
+            "reasoning": "Aucun outil trouvé",
+            "fallback": None
         }
 
     # ═══════════════════════════════════════
@@ -289,22 +403,15 @@ class Planner:
 
     def _detect_trading(self, objective_lower: str) -> Optional[Dict]:
         has_trading_word = bool(re.search(
-            r'trading|backtest|strat[eé]gi|forex|bourse',
-            objective_lower
+            r'trading|backtest|strat[eé]gi|forex|bourse', objective_lower
         ))
-
         has_symbol = bool(re.search(
             r'\b(eurusd|gbpusd|usdjpy|usdchf|audusd|usdcad|nzdusd'
             r'|eurjpy|gbpjpy|eurgbp|eurcad|eurchf|gbpcad|gbpchf'
-            r'|cadjpy|chfjpy|cadchf|xauusd|xagusd'
-            r'|usa500|usaind|usatec|ger40|uk100|fra40|jp225)\b',
+            r'|cadjpy|chfjpy|cadchf|xauusd|xagusd)\b',
             objective_lower
         ))
-
-        has_timeframe = bool(re.search(
-            r'\b(m1|m5|m15|m30|h1|h4|d1)\b',
-            objective_lower
-        ))
+        has_timeframe = bool(re.search(r'\b(m1|m5|m15|m30|h1|h4|d1)\b', objective_lower))
 
         trading_context = (
             has_trading_word
@@ -318,36 +425,6 @@ class Planner:
         if not trading_context:
             return None
 
-        # Info stratégie
-        if re.search(
-            r"c.est\s+quoi.*strat|quelle.*strat|montre.*strat"
-            r"|affiche.*strat|d[eé]tail.*strat|ta\s+strat"
-            r"|strat[eé]gi.*sur\s+\w{6}|donne.*strat",
-            objective_lower
-        ):
-            params = self._extract_trading_search_params(objective_lower)
-            params.setdefault("population_size", 10)
-            params.setdefault("max_generations", 3)
-            return {
-                "tool": "trading_search",
-                "params": params,
-                "reasoning": "Recherche stratégie spécifique"
-            }
-
-        # Test rapide
-        if re.search(
-            r'test.*rapide|quick.*test|essai.*rapide|rapide.*test'
-            r'|teste.*quelques|test.*strat[eé]gi'
-            r'|lance.*test.*trad|fais.*test.*trad',
-            objective_lower
-        ):
-            count = self._extract_number(objective_lower, default=5)
-            return {
-                "tool": "trading_quick_test",
-                "params": {"count": count},
-                "reasoning": f"Test rapide {count} stratégies"
-            }
-
         # Recherche / Optimisation / Trouve / Fait
         if re.search(
             r'cherch.*strat|trouv.*strat|optimis.*strat'
@@ -356,53 +433,56 @@ class Planner:
             r'|lance.*optimis|trouv.*trading|trouve.*trad'
             r'|fait.*strat.*trad|fais.*strat.*trad'
             r'|fait.*trading.*rentable|fais.*trading.*rentable'
-            r'|strat[eé]gi.*rentable',
+            r'|strat[eé]gi.*rentable'
+            r'|strat[eé]gi.*sur\s+\w{6}|donne.*strat',
             objective_lower
         ):
             params = self._extract_trading_search_params(objective_lower)
             params.setdefault("population_size", 10)
-            params.setdefault("max_generations", 5)
+            params.setdefault("max_generations", 3)
             return {
                 "tool": "trading_search",
                 "params": params,
-                "reasoning": "Recherche stratégie optimale"
+                "reasoning": "Recherche stratégie spécifique",
+                "fallback": "trading_generate"
+            }
+
+        # Test rapide
+        if re.search(r'test.*rapide|quick.*test|essai.*rapide|test.*strat', objective_lower):
+            count = self._extract_number(objective_lower, default=5)
+            return {
+                "tool": "trading_quick_test",
+                "params": {"count": count},
+                "reasoning": f"Test rapide {count} stratégies",
+                "fallback": None
             }
 
         # Amélioration
-        if re.search(
-            r'am[eé]lior.*strat|improve.*strat|optimis.*exist'
-            r'|mutation.*strat|affin.*strat',
-            objective_lower
-        ):
+        if re.search(r'am[eé]lior.*strat|improve.*strat|optimis.*exist', objective_lower):
             return {
                 "tool": "trading_improve",
                 "params": {"iterations": 20, "mutation_strength": 0.2},
-                "reasoning": "Amélioration stratégie"
+                "reasoning": "Amélioration stratégie",
+                "fallback": None
             }
 
         # Rapport
-        if re.search(
-            r'rapport.*trad|bilan.*trad|r[eé]sum[eé].*trad'
-            r'|report.*trad|stat.*trad|session.*trad',
-            objective_lower
-        ):
+        if re.search(r'rapport.*trad|bilan.*trad|r[eé]sum[eé].*trad|stat.*trad', objective_lower):
             return {
                 "tool": "trading_report",
                 "params": {},
-                "reasoning": "Rapport trading"
+                "reasoning": "Rapport trading",
+                "fallback": None
             }
 
         # Top stratégies
-        if re.search(
-            r'top.*strat|meilleur.*strat|classement.*strat'
-            r'|best.*strat|hall.*fame',
-            objective_lower
-        ):
+        if re.search(r'top.*strat|classement.*strat|best.*strat', objective_lower):
             count = self._extract_number(objective_lower, default=5)
             return {
                 "tool": "trading_top_strategies",
                 "params": {"count": count},
-                "reasoning": f"Top {count} stratégies"
+                "reasoning": f"Top {count} stratégies",
+                "fallback": None
             }
 
         # Backtest
@@ -412,10 +492,11 @@ class Planner:
             return {
                 "tool": "trading_quick_test",
                 "params": params,
-                "reasoning": "Backtest → test rapide"
+                "reasoning": "Backtest → test rapide",
+                "fallback": None
             }
 
-        # Symbole détecté
+        # Symbole détecté seul
         if has_symbol:
             params = self._extract_trading_search_params(objective_lower)
             params.setdefault("population_size", 10)
@@ -423,160 +504,90 @@ class Planner:
             return {
                 "tool": "trading_search",
                 "params": params,
-                "reasoning": "Trading avec symbole détecté"
-            }
-
-        # Rapide
-        if re.search(r'rapide|vite|quick|fast', objective_lower):
-            return {
-                "tool": "trading_quick_test",
-                "params": {"count": 5},
-                "reasoning": "Trading rapide → test rapide"
+                "reasoning": "Trading avec symbole détecté",
+                "fallback": "trading_generate"
             }
 
         return {
             "tool": "trading_search",
             "params": {"population_size": 10, "max_generations": 3},
-            "reasoning": "Trading générique → recherche légère"
+            "reasoning": "Trading générique → recherche",
+            "fallback": "trading_generate"
         }
 
     def _extract_trading_search_params(self, text: str) -> Dict[str, Any]:
         params = {}
-
         symbols = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "USDCHF",
                     "AUDUSD", "USDCAD", "NZDUSD", "EURJPY", "GBPJPY",
                     "EURGBP", "XAGUSD"]
-        for symbol in symbols:
-            if symbol.lower() in text:
-                params["symbols"] = [symbol]
+        for s in symbols:
+            if s.lower() in text:
+                params["symbols"] = [s]
                 break
 
-        timeframes = {"m1": "M1", "m5": "M5", "m15": "M15", "m30": "M30",
-                      "h1": "H1", "h4": "H4", "d1": "D1"}
-        for key, value in timeframes.items():
-            if key in text:
-                params["timeframes"] = [value]
+        tfs = {"m1": "M1", "m5": "M5", "m15": "M15", "m30": "M30",
+               "h1": "H1", "h4": "H4", "d1": "D1"}
+        for k, v in tfs.items():
+            if k in text:
+                params["timeframes"] = [v]
                 break
 
         gen_match = re.search(r'(\d+)\s*(?:gen|génération|generation|iter)', text)
         if gen_match:
             params["max_generations"] = int(gen_match.group(1))
-
         pop_match = re.search(r'(\d+)\s*(?:pop|population|strat)', text)
         if pop_match:
             params["population_size"] = int(pop_match.group(1))
-
         return params
 
     def _extract_number(self, text: str, default: int = 5) -> int:
         match = re.search(r'(\d+)', text)
         return int(match.group(1)) if match else default
 
-    # ═══════════════════════════════════════
-    # BUILD PARAMS
-    # ═══════════════════════════════════════
-
-    def _build_params(self, tool: str, objective: str, llm_response: str) -> Dict:
-        text = f"{objective} {llm_response}"
-
+    def _build_params(self, tool: str, objective: str) -> Dict:
         if tool == "calculator":
             expr_match = re.search(r'[\d\.\+\-\*/\(\)\^sqrt\s]{3,}', objective)
-            if expr_match:
-                return {"expression": expr_match.group().strip()}
-            return {"expression": objective}
-
+            return {"expression": expr_match.group().strip() if expr_match else objective}
         elif tool == "datetime":
             return {"format": "%Y-%m-%d %H:%M:%S"}
-
         elif tool == "system_info":
             return {}
-
         elif tool in ("list_directory", "read_file", "write_file", "file_info"):
-            path_match = re.search(r'[A-Za-z]:\\[^\s"\']+|/[^\s"\']+|\.[\\/][^\s"\']+', text)
-            if path_match:
-                return {"path": path_match.group()}
-            return {"path": "."}
-
+            path_match = re.search(r'[A-Za-z]:\\[^\s"\']+|/[^\s"\']+|\.[\\/][^\s"\']+', objective)
+            return {"path": path_match.group() if path_match else "."}
         elif tool in ("memory_search", "memory_stats"):
             return {"query": objective}
-
         elif tool == "list_allowed_paths":
             return {}
-
         elif tool == "code_executor":
-            code_match = re.search(r'```python\s*(.*?)\s*```', llm_response, re.DOTALL)
-            if code_match:
-                return {"code": code_match.group(1)}
-            code_match = re.search(r'```\s*(.*?)\s*```', llm_response, re.DOTALL)
-            if code_match:
-                return {"code": code_match.group(1)}
             return {"code": f"# {objective}\nprint('À implémenter')"}
-
         elif tool == "web_search":
             query = objective
-            for word in ["recherche", "cherche", "trouve", "sur", "info",
-                         "actualité", "news", "qu'est-ce que", "c'est quoi"]:
-                query = re.sub(rf'\b{word}\b', '', query, flags=re.IGNORECASE)
-            query = query.strip() or objective
-            source = "all"
-            if re.search(r'wikipedia|wiki', text, re.IGNORECASE):
-                source = "wikipedia"
-            elif re.search(r'news|actualit|nouvelle', text, re.IGNORECASE):
-                source = "news"
-            return {"query": query, "source": source}
-
+            for w in ["recherche", "cherche", "trouve", "sur", "info"]:
+                query = re.sub(rf'\b{w}\b', '', query, flags=re.IGNORECASE)
+            return {"query": query.strip() or objective}
         elif tool == "shell_command":
-            cmd_match = re.search(r'`([^`]+)`', text)
-            if cmd_match:
-                return {"command": cmd_match.group(1)}
-            for cmd in ["ping", "ipconfig", "systeminfo", "tasklist",
-                        "hostname", "whoami", "dir", "git", "pip", "python"]:
-                if cmd in text.lower():
-                    cmd_match = re.search(rf'({cmd}[^\n.,;]*)', text, re.IGNORECASE)
+            for cmd in ["ping", "ipconfig", "systeminfo", "tasklist", "hostname", "whoami"]:
+                if cmd in objective.lower():
+                    cmd_match = re.search(rf'({cmd}[^\n.,;]*)', objective, re.IGNORECASE)
                     if cmd_match:
                         return {"command": cmd_match.group(1).strip()}
             return {"command": "echo Commande non détectée"}
-
         elif tool == "mt5_tool":
-            text_lower = text.lower()
-            if any(w in text_lower for w in ["connect", "connexion", "connecte"]):
-                return {"action": "connect"}
-            elif any(w in text_lower for w in ["position", "trade ouvert"]):
-                return {"action": "positions"}
-            elif any(w in text_lower for w in ["compte", "account", "solde", "balance"]):
-                return {"action": "account_info"}
-            elif any(w in text_lower for w in ["historique", "donnée", "bougie"]):
-                symbol_match = re.search(r'\b([A-Z]{6})\b', text)
-                symbol = symbol_match.group(1) if symbol_match else "EURUSD"
-                return {"action": "historical_data", "symbol": symbol}
-            elif any(w in text_lower for w in ["symbole", "prix", "cours"]):
-                symbol_match = re.search(r'\b([A-Z]{6})\b', text)
-                symbol = symbol_match.group(1) if symbol_match else "EURUSD"
-                return {"action": "symbol_info", "symbol": symbol}
             return {"action": "connect"}
-
         elif tool == "task_planner":
             return {"problem": objective}
-
-        elif tool == "trading_quick_test":
-            return {"count": self._extract_number(objective, default=5)}
-
         elif tool == "trading_search":
             params = self._extract_trading_search_params(objective.lower())
             params.setdefault("population_size", 10)
-            params.setdefault("max_generations", 5)
+            params.setdefault("max_generations", 3)
             return params
-
+        elif tool == "trading_quick_test":
+            return {"count": self._extract_number(objective, default=5)}
         elif tool == "trading_improve":
             return {"iterations": 20, "mutation_strength": 0.2}
-
         elif tool == "trading_report":
             return {}
-
         elif tool == "trading_top_strategies":
             return {"count": self._extract_number(objective, default=5)}
-
         return {}
-
-
-planner = Planner()

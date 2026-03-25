@@ -1,499 +1,480 @@
-# micheline/tools/registry.py
 """
-Registre centralisé de tous les tools disponibles.
+micheline/tools/registry.py
+
+Registre central de tous les outils disponibles pour l'agent Micheline.
+Tous les appels d'outils passent par ce registre.
 """
 
 import logging
-import importlib
-import inspect
-from typing import Dict, Any, Callable, Optional
+import time
+from typing import Dict, Any, Optional, Callable, List
 
 logger = logging.getLogger("micheline.tools.registry")
 
 
+class ToolDefinition:
+    """Définition d'un outil enregistré."""
+
+    def __init__(self, name, func, description="", parameters=None, category="general"):
+        self.name = name
+        self.func = func
+        self.description = description
+        self.parameters = parameters or {}
+        self.category = category
+        self.call_count = 0
+        self.total_time = 0.0
+        self.last_error = None
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+            "category": self.category,
+            "call_count": self.call_count,
+            "avg_time": round(self.total_time / max(1, self.call_count), 3)
+        }
+
+
 class ToolRegistry:
+    """Registre central des outils."""
 
     def __init__(self):
-        self._tools: Dict[str, Dict[str, Any]] = {}
-        self._initialized = False
+        self._tools: Dict[str, ToolDefinition] = {}
+        self._categories: Dict[str, List[str]] = {}
+        self._memory_store: list = []
+        logger.info("ToolRegistry initialisé")
 
-    @property
-    def tools(self):
-        self._ensure_initialized()
-        return self._tools
+    # ═══════════════════════════════════
+    # MÉTHODES DE BASE
+    # ═══════════════════════════════════
 
-    @property
-    def tool_names(self):
-        self._ensure_initialized()
+    def register(self, name, func, description="", parameters=None, category="general"):
+        tool = ToolDefinition(name, func, description, parameters, category)
+        self._tools[name] = tool
+        if category not in self._categories:
+            self._categories[category] = []
+        if name not in self._categories[category]:
+            self._categories[category].append(name)
+        logger.debug(f"Outil enregistré: {name} [{category}]")
+
+    def get(self, name):
+        tool = self._tools.get(name)
+        return tool.func if tool else None
+
+    def execute(self, name, params=None):
+        params = params or {}
+        tool = self._tools.get(name)
+        if tool is None:
+            logger.error(f"Outil inconnu: {name}")
+            return {
+                "success": False,
+                "error": f"Outil '{name}' non trouvé",
+                "available_tools": list(self._tools.keys())
+            }
+
+        start_time = time.time()
+        try:
+            result = tool.func(params)
+            elapsed = time.time() - start_time
+            tool.call_count += 1
+            tool.total_time += elapsed
+            tool.last_error = None
+
+            if result is None:
+                return {"success": False, "error": f"'{name}' a retourné None", "execution_time": elapsed}
+            if not isinstance(result, dict):
+                return {"success": True, "data": result, "execution_time": elapsed}
+            result["execution_time"] = elapsed
+            return result
+
+        except Exception as e:
+            elapsed = time.time() - start_time
+            tool.call_count += 1
+            tool.total_time += elapsed
+            tool.last_error = str(e)
+            logger.error(f"Erreur {name}: {e}", exc_info=True)
+            return {"success": False, "error": str(e), "tool": name, "execution_time": elapsed}
+
+    def list_tools(self):
         return list(self._tools.keys())
 
-    def register(self, name: str, function: Callable,
-                 description: str = "", category: str = "general",
-                 param_schema: dict = None, **kwargs):
-        """
-        Enregistre un tool.
-        
-        Args:
-            name: nom unique
-            function: fonction à appeler
-            description: description pour le LLM
-            category: catégorie
-            param_schema: schéma des paramètres (utilisé par system_tools etc.)
-            **kwargs: tout autre argument ignoré silencieusement
-        """
-        self._tools[name] = {
-            "function": function,
-            "description": description,
-            "category": category,
-        }
-        if param_schema:
-            self._tools[name]["param_schema"] = param_schema
-        logger.debug(f"Tool enregistré : {name} [{category}]")
+    def list_by_category(self, category):
+        return self._categories.get(category, [])
 
-    def execute(self, name: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        self._ensure_initialized()
-        if name not in self._tools:
-            return {"error": f"Tool '{name}' non trouvé", "available": list(self._tools.keys())}
-        params = params or {}
-        try:
-            result = self._tools[name]["function"](**params)
-            logger.info(f"Tool '{name}' exécuté avec succès")
-            return result if isinstance(result, dict) else {"result": result}
-        except Exception as e:
-            logger.error(f"Erreur tool '{name}': {e}")
-            return {"error": str(e), "tool": name}
+    def get_all_categories(self):
+        return dict(self._categories)
 
-    def list_tools(self, category: Optional[str] = None) -> Dict[str, str]:
-        self._ensure_initialized()
-        tools = {}
-        for name, info in self._tools.items():
-            if category is None or info["category"] == category:
-                tools[name] = info["description"]
-        return tools
-
-    def get_tool_info(self, name: str) -> Optional[Dict[str, Any]]:
-        self._ensure_initialized()
-        if name in self._tools:
-            return {"name": name, "description": self._tools[name]["description"],
-                    "category": self._tools[name]["category"]}
-        return None
-
-    def get_tool(self, name: str) -> Optional[Callable]:
-        self._ensure_initialized()
-        if name in self._tools:
-            return self._tools[name]["function"]
-        return None
-
-    def has_tool(self, name: str) -> bool:
-        self._ensure_initialized()
-        return name in self._tools
-
-    def get_tools_for_prompt(self) -> str:
-        self._ensure_initialized()
-        if not self._tools:
-            return "Aucun outil disponible."
-        lines = []
-        categories = {}
-        for name, info in self._tools.items():
-            cat = info.get("category", "general")
-            if cat not in categories:
-                categories[cat] = []
-            categories[cat].append((name, info))
-        for cat, tools_list in sorted(categories.items()):
-            lines.append(f"\n📁 {cat.upper()} :")
-            for name, info in tools_list:
-                desc = info.get("description", "Pas de description")
-                lines.append(f"  • {name} : {desc}")
+    def get_tools_description(self):
+        lines = ["Outils disponibles:\n"]
+        for category, tool_names in sorted(self._categories.items()):
+            lines.append(f"\n[{category.upper()}]")
+            for name in tool_names:
+                tool = self._tools[name]
+                params_str = ", ".join(
+                    f"{k}: {v.get('type', 'any')}"
+                    for k, v in tool.parameters.items()
+                ) if tool.parameters else "aucun"
+                lines.append(f"  • {name}: {tool.description}")
+                lines.append(f"    Paramètres: {params_str}")
         return "\n".join(lines)
 
-    def _ensure_initialized(self):
-        if not self._initialized:
-            self._initialized = True
-            _do_register_all(self)
+    def get_stats(self):
+        return {
+            "total_tools": len(self._tools),
+            "categories": list(self._categories.keys()),
+            "tools": {name: tool.to_dict() for name, tool in self._tools.items()}
+        }
 
-    def __contains__(self, name):
-        self._ensure_initialized()
-        return name in self._tools
+    # ═══════════════════════════════════
+    # ENREGISTREMENT DE TOUS LES OUTILS
+    # ═══════════════════════════════════
 
-    def __len__(self):
-        self._ensure_initialized()
-        return len(self._tools)
+    def register_all(self):
+        logger.info("Enregistrement de tous les outils...")
+        self._register_trading_tools()
+        self._register_file_tools()
+        self._register_system_tools()
+        self._register_web_tools()
+        self._register_memory_tools()
+        self._register_analysis_tools()
+        logger.info(f"Total: {len(self._tools)} outils dans {len(self._categories)} catégories")
 
-    def __getitem__(self, name):
-        self._ensure_initialized()
-        return self._tools[name]
+    def _safe_call(self, func, params):
+        try:
+            result = func(params)
+            if result is None:
+                return {"success": False, "error": "Fonction a retourné None"}
+            if not isinstance(result, dict):
+                return {"success": True, "data": result}
+            return result
+        except Exception as e:
+            logger.error(f"Erreur safe_call: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
 
-    def __iter__(self):
-        self._ensure_initialized()
-        return iter(self._tools)
+    # ── TRADING ──
 
-    def __repr__(self):
-        return f"ToolRegistry({len(self._tools)} tools)"
+    def _register_trading_tools(self):
+        try:
+            try:
+                from micheline.tools.trading_tools import (
+                    trading_search, trading_generate, run_backtest,
+                    generate_random_strategy, format_strategy_summary
+                )
+            except ImportError:
+                from tools.trading_tools import (
+                    trading_search, trading_generate, run_backtest,
+                    generate_random_strategy, format_strategy_summary
+                )
 
+            self.register(
+                name="trading_search",
+                func=lambda p: self._safe_call(trading_search, p),
+                description="Recherche de stratégies de trading optimisées par algorithme génétique",
+                parameters={
+                    "symbols": {"type": "list", "description": "Symboles forex", "required": True},
+                    "population_size": {"type": "integer", "required": False, "default": 10},
+                    "max_generations": {"type": "integer", "required": False, "default": 3}
+                },
+                category="trading"
+            )
 
-# ──────────────────────────────────────────────
-# Instance globale
-# ──────────────────────────────────────────────
+            self.register(
+                name="trading_generate",
+                func=lambda p: self._safe_call(trading_generate, p),
+                description="Génère UNE stratégie simple (fallback rapide)",
+                parameters={
+                    "symbol": {"type": "string", "required": False, "default": "EURUSD"}
+                },
+                category="trading"
+            )
 
-tool_registry = ToolRegistry()
+            self.register(
+                name="trading_backtest",
+                func=lambda p: self._safe_call(
+                    lambda params: {"success": True, **run_backtest(params.get("strategy", {}))},
+                    p
+                ),
+                description="Lance un backtest sur une stratégie",
+                parameters={"strategy": {"type": "dict", "required": True}},
+                category="trading"
+            )
 
+            self.register(
+                name="trading_generate_random",
+                func=lambda p: self._safe_call(
+                    lambda params: {"success": True, "strategy": generate_random_strategy(params.get("symbol", "EURUSD"))},
+                    p
+                ),
+                description="Génère une config stratégie aléatoire sans backtest",
+                parameters={"symbol": {"type": "string", "required": False, "default": "EURUSD"}},
+                category="trading"
+            )
 
-# ──────────────────────────────────────────────
-# Fonctions raccourcis
-# ──────────────────────────────────────────────
+            logger.info("✅ Outils trading enregistrés")
 
-def register_tool(name, function, description="", category="general", **kwargs):
-    tool_registry.register(name, function, description, category, **kwargs)
+        except ImportError as e:
+            logger.error(f"❌ Import trading tools échoué: {e}")
+        except Exception as e:
+            logger.error(f"❌ Erreur enregistrement trading: {e}", exc_info=True)
 
-def execute_tool(name, params=None):
-    return tool_registry.execute(name, params)
+    # ── FICHIERS ──
 
-def list_tools(category=None):
-    return tool_registry.list_tools(category)
+    def _register_file_tools(self):
+        try:
+            has_file_tools = False
+            try:
+                try:
+                    from micheline.tools.file_tools import read_file, write_file, list_directory
+                except ImportError:
+                    from tools.file_tools import read_file, write_file, list_directory
+                has_file_tools = True
+            except ImportError:
+                pass
 
-def get_tool_info(name):
-    return tool_registry.get_tool_info(name)
+            if has_file_tools:
+                self.register("file_read", lambda p: self._safe_call(read_file, p),
+                              "Lit un fichier", {"path": {"type": "string", "required": True}}, "files")
+                self.register("file_write", lambda p: self._safe_call(write_file, p),
+                              "Écrit dans un fichier",
+                              {"path": {"type": "string", "required": True}, "content": {"type": "string", "required": True}},
+                              "files")
+                self.register("file_list", lambda p: self._safe_call(list_directory, p),
+                              "Liste un répertoire", {"path": {"type": "string", "required": True}}, "files")
+            else:
+                self.register("file_read", lambda p: self._file_read_fallback(p),
+                              "Lit un fichier", {"path": {"type": "string", "required": True}}, "files")
+                self.register("file_write", lambda p: self._file_write_fallback(p),
+                              "Écrit dans un fichier",
+                              {"path": {"type": "string", "required": True}, "content": {"type": "string", "required": True}},
+                              "files")
 
-def register_all_tools():
-    tool_registry._initialized = False
-    tool_registry._ensure_initialized()
+            logger.info("✅ Outils fichiers enregistrés")
+        except Exception as e:
+            logger.error(f"❌ Erreur fichiers: {e}")
 
+    # ── SYSTÈME ──
 
-# ──────────────────────────────────────────────
-# Import sécurisé
-# ──────────────────────────────────────────────
+    def _register_system_tools(self):
+        try:
+            self.register("system_info", lambda p: self._safe_call(self._get_system_info, p),
+                          "Informations système", {}, "system")
+            self.register("system_time", lambda p: {"success": True, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "timestamp": time.time()},
+                          "Heure actuelle", {}, "system")
+            self.register("tool_list", lambda p: {"success": True, "tools": self.list_tools(), "categories": self.get_all_categories(), "total": len(self._tools)},
+                          "Liste des outils", {}, "system")
+            self.register("tool_stats", lambda p: {"success": True, **self.get_stats()},
+                          "Stats des outils", {}, "system")
+            logger.info("✅ Outils système enregistrés")
+        except Exception as e:
+            logger.error(f"❌ Erreur système: {e}")
 
-def _safe_import(module_path: str):
-    try:
-        return importlib.import_module(module_path)
-    except Exception as e:
-        logger.debug(f"Module {module_path} non disponible: {e}")
-        return None
+    # ── WEB ──
 
+    def _register_web_tools(self):
+        try:
+            self.register("web_search", lambda p: self._safe_call(self._web_search, p),
+                          "Recherche web", {"query": {"type": "string", "required": True}}, "web")
+            self.register("web_fetch", lambda p: self._safe_call(self._web_fetch, p),
+                          "Récupère une URL", {"url": {"type": "string", "required": True}}, "web")
+            logger.info("✅ Outils web enregistrés")
+        except Exception as e:
+            logger.error(f"❌ Erreur web: {e}")
 
-# ──────────────────────────────────────────────
-# ENREGISTREMENT COMPLET
-# ──────────────────────────────────────────────
+    # ── MÉMOIRE ──
 
-def _do_register_all(registry: ToolRegistry):
-    logger.info("═══ Enregistrement des tools ═══")
-    total = 0
+    def _register_memory_tools(self):
+        try:
+            has_memory = False
+            try:
+                try:
+                    from micheline.memory.memory import store, retrieve
+                except ImportError:
+                    from memory.memory import store, retrieve
+                has_memory = True
+            except ImportError:
+                pass
 
-    # ── file_tools : register_file_tools(registry) ──
-    try:
-        from micheline.tools.file_tools import register_file_tools
-        before = len(registry._tools)
-        register_file_tools(registry)
-        added = len(registry._tools) - before
-        total += added
-        logger.info(f"  ✅ file_tools : {added} tools")
-    except ImportError as e:
-        logger.warning(f"  ⚠️ file_tools import: {e}")
-        # Fallback : auto-détection
-        mod = _safe_import("micheline.tools.file_tools")
-        if mod:
-            added = _auto_register_module(registry, mod, "file")
-            total += added
-    except Exception as e:
-        logger.warning(f"  ⚠️ file_tools erreur: {e}")
-        mod = _safe_import("micheline.tools.file_tools")
-        if mod:
-            added = _auto_register_module(registry, mod, "file")
-            total += added
+            if has_memory:
+                self.register("memory_store", lambda p: self._safe_call(lambda x: {"success": True, "stored": store(x)}, p),
+                              "Stocke en mémoire", {"data": {"type": "dict", "required": True}}, "memory")
+                self.register("memory_retrieve", lambda p: self._safe_call(lambda x: {"success": True, "results": retrieve(x.get("query", ""))}, p),
+                              "Recherche en mémoire", {"query": {"type": "string", "required": True}}, "memory")
+            else:
+                self.register("memory_store", lambda p: self._memory_store_fallback(p),
+                              "Stocke en mémoire (RAM)", {"data": {"type": "dict", "required": True}}, "memory")
+                self.register("memory_retrieve", lambda p: self._memory_retrieve_fallback(p),
+                              "Recherche en mémoire (RAM)", {"query": {"type": "string", "required": True}}, "memory")
 
-    # ── system_tools : register_system_tools(registry) ──
-    try:
-        from micheline.tools.system_tools import register_system_tools
-        before = len(registry._tools)
-        register_system_tools(registry)
-        added = len(registry._tools) - before
-        total += added
-        logger.info(f"  ✅ system_tools : {added} tools")
-    except ImportError as e:
-        logger.warning(f"  ⚠️ system_tools import: {e}")
-        mod = _safe_import("micheline.tools.system_tools")
-        if mod:
-            added = _auto_register_module(registry, mod, "system")
-            total += added
-    except Exception as e:
-        logger.warning(f"  ⚠️ system_tools erreur: {e}")
-        mod = _safe_import("micheline.tools.system_tools")
-        if mod:
-            added = _auto_register_module(registry, mod, "system")
-            total += added
+            logger.info("✅ Outils mémoire enregistrés")
+        except Exception as e:
+            logger.error(f"❌ Erreur mémoire: {e}")
 
-    # ── mt5_tool ──
-    try:
-        mt5_mod = _safe_import("micheline.tools.mt5_tool")
-        if mt5_mod:
-            before = len(registry._tools)
-            found = False
-            for fname in dir(mt5_mod):
-                if fname.startswith("register") and callable(getattr(mt5_mod, fname)):
-                    getattr(mt5_mod, fname)(registry)
-                    found = True
-                    break
-            if not found:
-                _auto_register_module(registry, mt5_mod, "mt5")
-            added = len(registry._tools) - before
-            total += added
-            if added > 0:
-                logger.info(f"  ✅ mt5_tool : {added} tools")
-    except Exception as e:
-        logger.warning(f"  ⚠️ mt5_tool: {e}")
+    # ── ANALYSE ──
 
-    # ── shell_tool ──
-    try:
-        mod = _safe_import("micheline.tools.shell_tool")
-        if mod:
-            before = len(registry._tools)
-            found = False
-            for fname in dir(mod):
-                if fname.startswith("register") and callable(getattr(mod, fname)):
-                    getattr(mod, fname)(registry)
-                    found = True
-                    break
-            if not found:
-                _auto_register_module(registry, mod, "shell")
-            added = len(registry._tools) - before
-            total += added
-            if added > 0:
-                logger.info(f"  ✅ shell_tool : {added} tools")
-    except Exception as e:
-        logger.warning(f"  ⚠️ shell_tool: {e}")
+    def _register_analysis_tools(self):
+        try:
+            self.register("analyze_strategy", lambda p: self._safe_call(self._analyze_strategy, p),
+                          "Analyse une stratégie", {"result": {"type": "dict", "required": True}}, "analysis")
+            self.register("compare_strategies", lambda p: self._safe_call(self._compare_strategies, p),
+                          "Compare des stratégies", {"strategies": {"type": "list", "required": True}}, "analysis")
+            logger.info("✅ Outils analyse enregistrés")
+        except Exception as e:
+            logger.error(f"❌ Erreur analyse: {e}")
 
-    # ── code_executor ──
-    try:
-        mod = _safe_import("micheline.tools.code_executor")
-        if mod:
-            before = len(registry._tools)
-            found = False
-            for fname in dir(mod):
-                if fname.startswith("register") and callable(getattr(mod, fname)):
-                    getattr(mod, fname)(registry)
-                    found = True
-                    break
-            if not found:
-                _auto_register_module(registry, mod, "code")
-            added = len(registry._tools) - before
-            total += added
-            if added > 0:
-                logger.info(f"  ✅ code_executor : {added} tools")
-    except Exception as e:
-        logger.warning(f"  ⚠️ code_executor: {e}")
+    # ═══════════════════════════════════
+    # IMPLÉMENTATIONS INTERNES
+    # ═══════════════════════════════════
 
-    # ── web_search_tool ──
-    try:
-        mod = _safe_import("micheline.tools.web_search_tool")
-        if mod:
-            before = len(registry._tools)
-            found = False
-            for fname in dir(mod):
-                if fname.startswith("register") and callable(getattr(mod, fname)):
-                    getattr(mod, fname)(registry)
-                    found = True
-                    break
-            if not found:
-                _auto_register_module(registry, mod, "web")
-            added = len(registry._tools) - before
-            total += added
-            if added > 0:
-                logger.info(f"  ✅ web_search_tool : {added} tools")
-    except Exception as e:
-        logger.warning(f"  ⚠️ web_search_tool: {e}")
+    def _get_system_info(self, params):
+        import platform
+        info = {
+            "success": True,
+            "os": platform.system(),
+            "os_version": platform.version(),
+            "python": platform.python_version(),
+            "machine": platform.machine(),
+        }
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            info["ram_total_mb"] = round(mem.total / 1024 / 1024)
+            info["ram_used_pct"] = mem.percent
+            info["ram_available_mb"] = round(mem.available / 1024 / 1024)
+            info["cpu_count"] = psutil.cpu_count()
+            info["cpu_pct"] = psutil.cpu_percent(interval=0.5)
+        except ImportError:
+            info["note"] = "psutil non installé"
+        return info
 
-    # ── app_launcher ──
-    try:
-        mod = _safe_import("micheline.tools.app_launcher")
-        if mod:
-            before = len(registry._tools)
-            found = False
-            for fname in dir(mod):
-                if fname.startswith("register") and callable(getattr(mod, fname)):
-                    getattr(mod, fname)(registry)
-                    found = True
-                    break
-            if not found:
-                _auto_register_module(registry, mod, "app")
-            added = len(registry._tools) - before
-            total += added
-            if added > 0:
-                logger.info(f"  ✅ app_launcher : {added} tools")
-    except Exception as e:
-        logger.warning(f"  ⚠️ app_launcher: {e}")
+    def _web_search(self, params):
+        query = params.get("query", "")
+        if not query:
+            return {"success": False, "error": "'query' requis"}
+        try:
+            import urllib.request, urllib.parse, json
+            encoded = urllib.parse.quote(query)
+            url = f"https://api.duckduckgo.com/?q={encoded}&format=json&no_html=1"
+            req = urllib.request.Request(url, headers={"User-Agent": "Micheline/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
+            results = []
+            if data.get("AbstractText"):
+                results.append({"title": data.get("Heading", ""), "text": data["AbstractText"], "url": data.get("AbstractURL", "")})
+            for topic in data.get("RelatedTopics", [])[:5]:
+                if isinstance(topic, dict) and "Text" in topic:
+                    results.append({"title": topic.get("Text", "")[:100], "text": topic.get("Text", ""), "url": topic.get("FirstURL", "")})
+            return {"success": True, "query": query, "results": results, "count": len(results)}
+        except Exception as e:
+            return {"success": False, "error": str(e), "query": query}
 
-    # ── task_planner_tool ──
-    try:
-        mod = _safe_import("micheline.tools.task_planner_tool")
-        if mod:
-            before = len(registry._tools)
-            found = False
-            for fname in dir(mod):
-                if fname.startswith("register") and callable(getattr(mod, fname)):
-                    getattr(mod, fname)(registry)
-                    found = True
-                    break
-            if not found:
-                _auto_register_module(registry, mod, "planner")
-            added = len(registry._tools) - before
-            total += added
-            if added > 0:
-                logger.info(f"  ✅ task_planner_tool : {added} tools")
-    except Exception as e:
-        logger.warning(f"  ⚠️ task_planner_tool: {e}")
+    def _web_fetch(self, params):
+        url = params.get("url", "")
+        if not url:
+            return {"success": False, "error": "'url' requis"}
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers={"User-Agent": "Micheline/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as response:
+                content = response.read().decode("utf-8", errors="replace")
+            return {"success": True, "url": url, "content": content[:5000], "length": len(content), "truncated": len(content) > 5000}
+        except Exception as e:
+            return {"success": False, "error": str(e), "url": url}
 
-    # ── memory ──
-    try:
-        mod = _safe_import("micheline.memory.memory")
-        if mod:
-            before = len(registry._tools)
-            found = False
-            for fname in dir(mod):
-                if fname.startswith("register") and callable(getattr(mod, fname)):
-                    getattr(mod, fname)(registry)
-                    found = True
-                    break
-            if not found:
-                _auto_register_module(registry, mod, "memory")
-            added = len(registry._tools) - before
-            total += added
-            if added > 0:
-                logger.info(f"  ✅ memory : {added} tools")
-    except Exception as e:
-        logger.warning(f"  ⚠️ memory: {e}")
+    def _file_read_fallback(self, params):
+        path = params.get("path", "")
+        if not path:
+            return {"success": False, "error": "'path' requis"}
+        try:
+            try:
+                from micheline.security.path_guard import is_allowed
+            except ImportError:
+                try:
+                    from security.path_guard import is_allowed
+                except ImportError:
+                    is_allowed = lambda p: True
+            if not is_allowed(path):
+                return {"success": False, "error": f"Accès refusé: {path}"}
+        except Exception:
+            pass
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return {"success": True, "path": path, "content": content, "length": len(content)}
+        except Exception as e:
+            return {"success": False, "error": str(e), "path": path}
 
-    # ── security/path_guard ──
-    try:
-        mod = _safe_import("micheline.security.path_guard")
-        if mod:
-            before = len(registry._tools)
-            found = False
-            for fname in dir(mod):
-                if fname.startswith("register") and callable(getattr(mod, fname)):
-                    getattr(mod, fname)(registry)
-                    found = True
-                    break
-            if not found:
-                _auto_register_module(registry, mod, "security")
-            added = len(registry._tools) - before
-            total += added
-            if added > 0:
-                logger.info(f"  ✅ security : {added} tools")
-    except Exception as e:
-        logger.warning(f"  ⚠️ security: {e}")
+    def _file_write_fallback(self, params):
+        path = params.get("path", "")
+        content = params.get("content", "")
+        if not path:
+            return {"success": False, "error": "'path' requis"}
+        try:
+            try:
+                from micheline.security.path_guard import is_allowed
+            except ImportError:
+                try:
+                    from security.path_guard import is_allowed
+                except ImportError:
+                    is_allowed = lambda p: True
+            if not is_allowed(path):
+                return {"success": False, "error": f"Accès refusé: {path}"}
+        except Exception:
+            pass
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return {"success": True, "path": path, "written": len(content)}
+        except Exception as e:
+            return {"success": False, "error": str(e), "path": path}
 
-    # ── Trading Engine (Phase 6) ──
-    trading_count = _register_trading_engine(registry)
-    total += trading_count
+    def _memory_store_fallback(self, params):
+        data = params.get("data", params)
+        self._memory_store.append({"timestamp": time.time(), "data": data})
+        return {"success": True, "stored": True, "total_entries": len(self._memory_store)}
 
-    logger.info(f"═══ Total : {total} tools enregistrés ═══")
+    def _memory_retrieve_fallback(self, params):
+        query = str(params.get("query", "")).lower()
+        results = [e for e in self._memory_store if query in str(e.get("data", "")).lower()]
+        return {"success": True, "query": query, "results": results[-10:], "count": len(results)}
 
+    def _analyze_strategy(self, params):
+        result = params.get("result", {})
+        if not result:
+            return {"success": False, "error": "'result' requis"}
+        try:
+            try:
+                from micheline.trading.metrics import evaluate_strategy
+            except ImportError:
+                from trading.metrics import evaluate_strategy
+            score = evaluate_strategy(result)
+        except ImportError:
+            score = 0
+        analysis = {
+            "success": True,
+            "score": score,
+            "verdict": "excellent" if score >= 60 else "acceptable" if score >= 40 else "faible",
+            "recommendations": []
+        }
+        if result.get("winrate", 0) < 0.4:
+            analysis["recommendations"].append("Winrate faible")
+        if result.get("drawdown", 0) > 500:
+            analysis["recommendations"].append("Drawdown élevé")
+        if result.get("trades", 0) < 30:
+            analysis["recommendations"].append("Trop peu de trades")
+        return analysis
 
-def _auto_register_module(registry: ToolRegistry, module, category: str) -> int:
-    count = 0
-    module_name = module.__name__
-    for name, obj in inspect.getmembers(module):
-        if name.startswith("_"):
-            continue
-        if not callable(obj):
-            continue
-        if inspect.isclass(obj):
-            continue
-        if inspect.ismodule(obj):
-            continue
-        if name.startswith("register"):
-            continue
-        if hasattr(obj, "__module__") and obj.__module__ != module_name:
-            continue
-        doc = inspect.getdoc(obj) or f"Fonction {name}"
-        description = doc.split("\n")[0].strip()
-        registry.register(name, obj, description, category)
-        count += 1
-    if count > 0:
-        logger.info(f"  ✅ {module_name} (auto) : {count} tools")
-    return count
-
-
-def _register_trading_engine(registry: ToolRegistry) -> int:
-    count = 0
-
-    # Chercher backtest dans mt5_tool
-    backtest_fn = None
-    mt5_mod = _safe_import("micheline.tools.mt5_tool")
-    if mt5_mod:
-        for fname in ["run_backtest", "backtest", "tool_backtest"]:
-            if hasattr(mt5_mod, fname):
-                backtest_fn = getattr(mt5_mod, fname)
-                break
-
-    if backtest_fn is None:
-        import random
-        import hashlib
-
-        def simulated_backtest(config=None, **kwargs):
-            """Backtest simulé."""
-            config = config or kwargs
-            seed_str = str(sorted(str(config).encode()))
-            seed = int(hashlib.md5(seed_str.encode()).hexdigest()[:8], 16)
-            rng = random.Random(seed)
-            trades = rng.randint(20, 150)
-            winrate = round(rng.uniform(30, 70), 2)
-            profit = round(rng.uniform(-2000, 5000), 2)
-            drawdown = round(rng.uniform(5, 40), 2)
-            return {
-                "profit": profit, "drawdown": drawdown,
-                "trades": trades, "winrate": winrate,
-                "gross_profit": round(max(0, profit * 1.5), 2),
-                "gross_loss": round(-abs(min(0, profit * 0.5)), 2),
-                "initial_deposit": 10000.0, "simulated": True,
-            }
-        backtest_fn = simulated_backtest
-
-    try:
-        # ← CORRECTION ICI : micheline.trading, pas trading
-        from micheline.trading.engine import TradingEngine
-
-        store_fn = None
-        retrieve_fn = None
-        mem_mod = _safe_import("micheline.memory.memory")
-        if mem_mod:
-            for cname in dir(mem_mod):
-                obj = getattr(mem_mod, cname)
-                if inspect.isclass(obj) and "memory" in cname.lower():
-                    try:
-                        mem_instance = obj()
-                        if hasattr(mem_instance, "store_experience"):
-                            store_fn = mem_instance.store_experience
-                        if hasattr(mem_instance, "search_experiences"):
-                            retrieve_fn = mem_instance.search_experiences
-                    except Exception:
-                        pass
-                    break
-
-        engine = TradingEngine(
-            run_backtest_fn=backtest_fn,
-            store_fn=store_fn,
-            retrieve_fn=retrieve_fn,
-        )
-
-        registry.register("trading_search", engine.search_strategy,
-                          "Rechercher une stratégie de trading optimale", "trading")
-        registry.register("trading_quick_test", engine.quick_test,
-                          "Test rapide de stratégies aléatoires", "trading")
-        registry.register("trading_evaluate", engine.evaluate_strategy,
-                          "Évaluer une stratégie de trading", "trading")
-        registry.register("trading_improve", engine.improve_strategy,
-                          "Améliorer une stratégie par mutations", "trading")
-        registry.register("trading_top_strategies", engine.get_top_strategies,
-                          "Meilleures stratégies trouvées", "trading")
-        registry.register("trading_report", engine.get_session_report,
-                          "Rapport de session trading", "trading")
-        count = 6
-        logger.info(f"  ✅ Trading Engine : {count} tools")
-
-    except ImportError as e:
-        logger.warning(f"  ⚠️ Trading engine: {e}")
-    except Exception as e:
-        logger.warning(f"  ⚠️ Trading engine erreur: {e}")
-
-    return count
+    def _compare_strategies(self, params):
+        strategies = params.get("strategies", [])
+        if not strategies:
+            return {"success": False, "error": "'strategies' requis"}
+        try:
+            try:
+                from micheline.trading.metrics import evaluate_strategy
+            except ImportError:
+                from trading.metrics import evaluate_strategy
+            scored = [{"index": i, "score": evaluate_strategy(s), **s} for i, s in enumerate(strategies)]
+            scored.sort(key=lambda x: x["score"], reverse=True)
+            return {"success": True, "ranking": scored, "best_index": scored[0]["index"]}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
