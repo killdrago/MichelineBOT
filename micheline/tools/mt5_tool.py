@@ -1,279 +1,417 @@
+# micheline/tools/mt5_tool.py
 """
-MetaTrader 5 Tool — Interface avec MT5 pour le trading.
-Emplacement : micheline/tools/mt5_tool.py
+Outils d'interaction avec MetaTrader 5.
+Phase 5 + Phase 6 (Trading Engine compatible).
+Fallback automatique sur simulation si données indisponibles.
 """
 
-import json
-from typing import Dict, Any, Optional, List
-from datetime import datetime
+import logging
+import random
+import hashlib
+from typing import Dict, Any, Optional
+
+logger = logging.getLogger("micheline.tools.mt5_tool")
+
+# Essayer d'importer MT5
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    MT5_AVAILABLE = False
+    logger.warning("MetaTrader5 non installé — mode simulation activé")
+
+# Cache des symboles disponibles
+_available_symbols = None
+_mt5_connected = False
 
 
-class MT5Interface:
-    """Interface avec MetaTrader 5."""
-    
-    def __init__(self):
-        self.mt5 = None
-        self.connected = False
-        self._try_import()
-    
-    def _try_import(self):
-        """Tente d'importer MetaTrader5."""
-        try:
-            import MetaTrader5 as mt5
-            self.mt5 = mt5
-        except ImportError:
-            self.mt5 = None
-    
-    def connect(self) -> Dict[str, Any]:
-        """Se connecte à MT5."""
-        if self.mt5 is None:
-            return {"success": False, "error": "MetaTrader5 n'est pas installé. Installe-le avec : pip install MetaTrader5"}
-        
-        try:
-            if not self.mt5.initialize():
-                return {"success": False, "error": f"Impossible d'initialiser MT5 : {self.mt5.last_error()}"}
-            
-            self.connected = True
-            info = self.mt5.terminal_info()
-            account = self.mt5.account_info()
-            
-            return {
-                "success": True,
-                "terminal": {
-                    "company": info.company if info else "N/A",
-                    "connected": info.connected if info else False,
-                    "build": info.build if info else "N/A"
-                },
-                "account": {
-                    "login": account.login if account else "N/A",
-                    "balance": account.balance if account else 0,
-                    "equity": account.equity if account else 0,
-                    "currency": account.currency if account else "N/A",
-                    "server": account.server if account else "N/A"
-                }
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-    
-    def disconnect(self):
-        """Déconnecte MT5."""
-        if self.mt5 and self.connected:
-            self.mt5.shutdown()
-            self.connected = False
-    
-    def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
-        """Obtient les infos d'un symbole."""
-        if not self._ensure_connected():
-            return {"error": "Non connecté à MT5"}
-        
-        try:
-            info = self.mt5.symbol_info(symbol)
-            if info is None:
-                return {"error": f"Symbole '{symbol}' non trouvé"}
-            
-            tick = self.mt5.symbol_info_tick(symbol)
-            
-            return {
-                "symbol": symbol,
-                "bid": tick.bid if tick else None,
-                "ask": tick.ask if tick else None,
-                "spread": info.spread,
-                "digits": info.digits,
-                "volume_min": info.volume_min,
-                "volume_max": info.volume_max,
-                "trade_mode": info.trade_mode,
-                "description": info.description
-            }
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def get_historical_data(self, symbol: str, timeframe: str = "H1", 
-                            bars: int = 100) -> Dict[str, Any]:
-        """Récupère les données historiques."""
-        if not self._ensure_connected():
-            return {"error": "Non connecté à MT5"}
-        
-        try:
-            # Mapper les timeframes
-            tf_map = {
-                "M1": self.mt5.TIMEFRAME_M1,
-                "M5": self.mt5.TIMEFRAME_M5,
-                "M15": self.mt5.TIMEFRAME_M15,
-                "M30": self.mt5.TIMEFRAME_M30,
-                "H1": self.mt5.TIMEFRAME_H1,
-                "H4": self.mt5.TIMEFRAME_H4,
-                "D1": self.mt5.TIMEFRAME_D1,
-                "W1": self.mt5.TIMEFRAME_W1,
-                "MN1": self.mt5.TIMEFRAME_MN1,
-            }
-            
-            tf = tf_map.get(timeframe.upper())
-            if tf is None:
-                return {"error": f"Timeframe invalide : {timeframe}. Valides : {', '.join(tf_map.keys())}"}
-            
-            rates = self.mt5.copy_rates_from_pos(symbol, tf, 0, bars)
-            
-            if rates is None or len(rates) == 0:
-                return {"error": f"Aucune donnée pour {symbol} {timeframe}"}
-            
-            # Convertir en format lisible
-            data = []
-            for rate in rates[-10:]:  # Dernières 10 bougies pour l'affichage
-                data.append({
-                    "time": datetime.fromtimestamp(rate[0]).strftime('%Y-%m-%d %H:%M'),
-                    "open": rate[1],
-                    "high": rate[2],
-                    "low": rate[3],
-                    "close": rate[4],
-                    "volume": rate[5]
-                })
-            
-            return {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "total_bars": len(rates),
-                "last_10_bars": data,
-                "stats": {
-                    "highest_high": max(r[2] for r in rates),
-                    "lowest_low": min(r[3] for r in rates),
-                    "avg_volume": sum(r[5] for r in rates) / len(rates),
-                    "latest_close": rates[-1][4],
-                    "period_change_pct": round((rates[-1][4] - rates[0][1]) / rates[0][1] * 100, 4)
-                }
-            }
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def get_positions(self) -> Dict[str, Any]:
-        """Obtient les positions ouvertes."""
-        if not self._ensure_connected():
-            return {"error": "Non connecté à MT5"}
-        
-        try:
-            positions = self.mt5.positions_get()
-            if positions is None:
-                return {"positions": [], "count": 0}
-            
-            pos_list = []
-            for pos in positions:
-                pos_list.append({
-                    "ticket": pos.ticket,
-                    "symbol": pos.symbol,
-                    "type": "BUY" if pos.type == 0 else "SELL",
-                    "volume": pos.volume,
-                    "price_open": pos.price_open,
-                    "price_current": pos.price_current,
-                    "profit": pos.profit,
-                    "sl": pos.sl,
-                    "tp": pos.tp,
-                    "comment": pos.comment
-                })
-            
-            total_profit = sum(p["profit"] for p in pos_list)
-            
-            return {
-                "positions": pos_list,
-                "count": len(pos_list),
-                "total_profit": round(total_profit, 2)
-            }
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def get_account_info(self) -> Dict[str, Any]:
-        """Obtient les infos du compte."""
-        if not self._ensure_connected():
-            return {"error": "Non connecté à MT5"}
-        
-        try:
-            account = self.mt5.account_info()
-            if account is None:
-                return {"error": "Impossible d'obtenir les infos du compte"}
-            
-            return {
-                "login": account.login,
-                "balance": account.balance,
-                "equity": account.equity,
-                "margin": account.margin,
-                "free_margin": account.margin_free,
-                "margin_level": account.margin_level,
-                "profit": account.profit,
-                "currency": account.currency,
-                "leverage": account.leverage,
-                "server": account.server,
-                "trade_allowed": account.trade_allowed
-            }
-        except Exception as e:
-            return {"error": str(e)}
-    
-    def _ensure_connected(self) -> bool:
-        """Vérifie et rétablit la connexion si nécessaire."""
-        if not self.mt5:
+def _ensure_connected() -> bool:
+    """S'assure que MT5 est connecté."""
+    global _mt5_connected
+    if not MT5_AVAILABLE:
+        return False
+    if not _mt5_connected:
+        if mt5.initialize():
+            _mt5_connected = True
+        else:
+            logger.warning(f"MT5 init échoué: {mt5.last_error()}")
             return False
-        if not self.connected:
-            result = self.connect()
-            return result.get("success", False)
-        return True
+    return True
 
 
-# Instance globale
-_mt5 = MT5Interface()
+def _get_available_symbols() -> list:
+    """Récupère et cache la liste des symboles disponibles dans MT5."""
+    global _available_symbols
+    if _available_symbols is not None:
+        return _available_symbols
+
+    if not _ensure_connected():
+        _available_symbols = []
+        return _available_symbols
+
+    try:
+        symbols = mt5.symbols_get()
+        if symbols:
+            _available_symbols = [s.name for s in symbols if s.visible]
+            logger.info(f"MT5: {len(_available_symbols)} symboles disponibles")
+        else:
+            _available_symbols = []
+    except Exception as e:
+        logger.warning(f"Erreur récupération symboles: {e}")
+        _available_symbols = []
+
+    return _available_symbols
 
 
-def mt5_tool(action: str, symbol: str = None, timeframe: str = "H1", 
-             bars: int = 100, **kwargs) -> str:
-    """
-    Point d'entrée pour le tool registry.
-    
-    Args:
-        action: "connect", "disconnect", "symbol_info", "historical_data", 
-                "positions", "account_info"
-        symbol: Symbole (EURUSD, BTCUSD, etc.)
-        timeframe: M1, M5, M15, M30, H1, H4, D1, W1, MN1
-        bars: Nombre de bougies historiques
-    
-    Returns:
-        Résultat formaté en texte
-    """
-    action = (action or "").strip().lower()
-    
-    actions_map = {
-        "connect": lambda: _mt5.connect(),
-        "disconnect": lambda: (_mt5.disconnect(), {"success": True, "message": "Déconnecté de MT5"})[1],
-        "symbol_info": lambda: _mt5.get_symbol_info(symbol) if symbol else {"error": "Symbole requis"},
-        "historical_data": lambda: _mt5.get_historical_data(symbol, timeframe, bars) if symbol else {"error": "Symbole requis"},
-        "history": lambda: _mt5.get_historical_data(symbol, timeframe, bars) if symbol else {"error": "Symbole requis"},
-        "positions": lambda: _mt5.get_positions(),
-        "account_info": lambda: _mt5.get_account_info(),
-        "account": lambda: _mt5.get_account_info(),
+def _get_mt5_timeframe(tf_str: str):
+    """Convertit un string timeframe en constante MT5."""
+    if not MT5_AVAILABLE:
+        return None
+
+    tf_map = {
+        "M1": mt5.TIMEFRAME_M1,
+        "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
+        "M30": mt5.TIMEFRAME_M30,
+        "H1": mt5.TIMEFRAME_H1,
+        "H4": mt5.TIMEFRAME_H4,
+        "D1": mt5.TIMEFRAME_D1,
     }
-    
-    if action not in actions_map:
-        return f"Action MT5 inconnue : '{action}'. Actions disponibles : {', '.join(sorted(set(actions_map.keys())))}"
-    
-    result = actions_map[action]()
-    
-    # Formater le résultat
-    if isinstance(result, dict):
-        if "error" in result:
-            return f"❌ MT5 Erreur : {result['error']}"
-        
-        return f"📊 MT5 — {action} :\n{json.dumps(result, indent=2, ensure_ascii=False, default=str)}"
-    
-    return str(result)
+    return tf_map.get(tf_str.upper(), mt5.TIMEFRAME_H1)
 
 
-# Métadonnées pour le registry
-TOOL_NAME = "mt5_tool"
-TOOL_DESCRIPTION = (
-    "Interface MetaTrader 5 pour le trading. "
-    "Actions : 'connect' (connexion), 'account_info' (infos compte), "
-    "'symbol_info' (infos symbole), 'historical_data' (données historiques), "
-    "'positions' (positions ouvertes), 'disconnect' (déconnexion). "
-    "Nécessite MetaTrader 5 installé et ouvert."
-)
-TOOL_PARAMETERS = {
-    "action": "str — 'connect', 'account_info', 'symbol_info', 'historical_data', 'positions', 'disconnect'",
-    "symbol": "str — Symbole trading (ex: 'EURUSD', 'BTCUSD') — requis pour symbol_info et historical_data",
-    "timeframe": "str — M1, M5, M15, M30, H1, H4, D1, W1, MN1 (défaut: H1)",
-    "bars": "int — Nombre de bougies historiques (défaut: 100)"
-}
+def initialize_mt5() -> Dict[str, Any]:
+    """Initialise la connexion à MT5."""
+    global _mt5_connected
+
+    if not MT5_AVAILABLE:
+        return {"success": False, "error": "MetaTrader5 non installé"}
+
+    if not mt5.initialize():
+        return {"success": False, "error": f"MT5 init failed: {mt5.last_error()}"}
+
+    _mt5_connected = True
+    info = mt5.terminal_info()
+    return {
+        "success": True,
+        "terminal": info.name if info else "unknown",
+        "connected": True,
+    }
+
+
+def shutdown_mt5() -> Dict[str, Any]:
+    """Ferme la connexion MT5."""
+    global _mt5_connected
+    if MT5_AVAILABLE:
+        mt5.shutdown()
+        _mt5_connected = False
+    return {"success": True}
+
+
+def run_backtest(config: Dict[str, Any] = None, **kwargs) -> Dict[str, Any]:
+    """
+    Exécute un backtest.
+    Retourne les résultats avec les dates de la période testée.
+    """
+    if config is None:
+        config = kwargs
+    elif kwargs:
+        config = {**config, **kwargs}
+
+    symbol = config.get("symbol", "EURUSD")
+    timeframe = config.get("timeframe", "H1")
+
+    # Essayer avec les vraies données MT5
+    if _ensure_connected():
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            for suffix in [".raw", ".pro", ".std", ".ecn", ""]:
+                alt = symbol + suffix
+                alt_info = mt5.symbol_info(alt)
+                if alt_info is not None:
+                    symbol = alt
+                    symbol_info = alt_info
+                    break
+
+        if symbol_info is not None:
+            if not symbol_info.visible:
+                mt5.symbol_select(symbol, True)
+
+            mt5_tf = _get_mt5_timeframe(timeframe)
+            bars_count = config.get("bars_count", 5000)
+            rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, bars_count)
+
+            if rates is not None and len(rates) > 10:
+                logger.debug(f"Backtest réel : {symbol} {timeframe} ({len(rates)} barres)")
+                return _simulate_trades_on_data(rates, config, symbol)
+            else:
+                logger.debug(f"Pas de données pour {symbol} {timeframe}, fallback simulation")
+        else:
+            logger.debug(f"Symbole {symbol} non trouvé dans MT5, fallback simulation")
+
+    return _run_simulated_backtest(config, symbol, timeframe)
+
+
+def _simulate_trades_on_data(
+    rates, config: Dict[str, Any], symbol: str
+) -> Dict[str, Any]:
+    """Simule des trades sur des données OHLCV réelles de MT5."""
+    from datetime import datetime
+
+    initial_deposit = 10000.0
+    balance = initial_deposit
+    max_balance = balance
+    max_drawdown = 0.0
+    trades_count = 0
+    wins = 0
+    gross_profit = 0.0
+    gross_loss = 0.0
+
+    risk_mgmt = config.get("risk_management", {})
+    lot_size = risk_mgmt.get("lot_size", 0.1)
+    exit_logic = config.get("exit_logic", {})
+
+    tp_pips = 50
+    sl_pips = 30
+
+    exit_type = exit_logic.get("type", "fixed_tp_sl")
+    if exit_type == "fixed_tp_sl":
+        tp_pips = exit_logic.get("params", {}).get("take_profit_pips", 50)
+        sl_pips = exit_logic.get("params", {}).get("stop_loss_pips", 30)
+    elif exit_type == "atr_based":
+        tp_pips = 60
+        sl_pips = 30
+    elif exit_type == "trailing_stop":
+        tp_pips = 80
+        sl_pips = exit_logic.get("params", {}).get("initial_sl_pips", 40)
+
+    if "JPY" in symbol:
+        pip_value = 0.01
+    elif "XAU" in symbol:
+        pip_value = 0.1
+    elif "XAG" in symbol:
+        pip_value = 0.01
+    elif symbol in ("Usa500", "UsaInd", "UsaTec", "Ger40", "UK100", "Fra40", "Jp225",
+                     "US500", "US30", "GER40"):
+        pip_value = 1.0
+    else:
+        pip_value = 0.0001
+
+    trade_value_per_pip = lot_size * 100000 * pip_value
+
+    if symbol in ("Usa500", "UsaInd", "UsaTec", "Ger40", "UK100", "Fra40", "Jp225",
+                   "US500", "US30", "GER40"):
+        trade_value_per_pip = lot_size * 10
+
+    trade_interval = max(3, len(rates) // 200)
+
+    config_str = str(config.get("id", "")) + symbol
+    seed = int(hashlib.md5(config_str.encode()).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+
+    # ── Dates de la période ──
+    try:
+        date_start = datetime.fromtimestamp(int(rates[0]['time']))
+        date_end = datetime.fromtimestamp(int(rates[-1]['time']))
+    except Exception:
+        date_start = None
+        date_end = None
+
+    for i in range(trade_interval, len(rates) - trade_interval, trade_interval):
+        bar_open = rates[i]
+        bar_close = rates[min(i + trade_interval, len(rates) - 1)]
+
+        direction = 1 if rng.random() > 0.45 else -1
+        price_move = (float(bar_close['close']) - float(bar_open['close'])) * direction
+        pips_moved = price_move / pip_value if pip_value > 0 else 0
+
+        if pips_moved >= tp_pips:
+            pips_result = tp_pips
+        elif pips_moved <= -sl_pips:
+            pips_result = -sl_pips
+        else:
+            pips_result = pips_moved
+
+        trade_pnl = pips_result * trade_value_per_pip
+        balance += trade_pnl
+        trades_count += 1
+
+        if trade_pnl > 0:
+            wins += 1
+            gross_profit += trade_pnl
+        else:
+            gross_loss += trade_pnl
+
+        max_balance = max(max_balance, balance)
+        current_dd = ((max_balance - balance) / max_balance) * 100 if max_balance > 0 else 0
+        max_drawdown = max(max_drawdown, current_dd)
+
+        if balance <= initial_deposit * 0.1:
+            break
+
+    winrate = (wins / trades_count * 100) if trades_count > 0 else 0
+
+    return {
+        "profit": round(balance - initial_deposit, 2),
+        "drawdown": round(max_drawdown, 2),
+        "trades": trades_count,
+        "winrate": round(winrate, 2),
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss": round(gross_loss, 2),
+        "initial_deposit": initial_deposit,
+        "final_balance": round(balance, 2),
+        "symbol": symbol,
+        "data_source": "mt5_real",
+        "bars_used": len(rates),
+        "date_start": date_start.strftime("%Y-%m-%d") if date_start else "N/A",
+        "date_end": date_end.strftime("%Y-%m-%d") if date_end else "N/A",
+    }
+
+
+def _run_simulated_backtest(
+    config: Dict[str, Any],
+    symbol: str,
+    timeframe: str,
+) -> Dict[str, Any]:
+    """Backtest simulé quand les données MT5 ne sont pas disponibles."""
+    from datetime import datetime, timedelta
+
+    config_str = str(sorted(str(config).encode()))
+    seed = int(hashlib.md5(config_str.encode()).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+
+    is_full_strategy = "indicators" in config and "entry_logic" in config
+    quality = _estimate_strategy_quality(config, is_full_strategy, rng)
+
+    initial_deposit = 10000.0
+    base_trades = rng.randint(20, 200)
+    trades = int(base_trades * quality["trade_frequency"])
+    trades = max(5, trades)
+
+    base_winrate = 45 + quality["quality_bonus"] * 15
+    winrate = max(20, min(80, base_winrate + rng.gauss(0, 8)))
+
+    winning_trades = int(trades * winrate / 100)
+    losing_trades = trades - winning_trades
+
+    avg_win = rng.uniform(10, 100) * quality["reward_factor"]
+    avg_loss = rng.uniform(10, 80) * quality["risk_factor"]
+
+    gross_profit = round(winning_trades * avg_win, 2)
+    gross_loss = round(losing_trades * avg_loss, 2)
+    net_profit = round(gross_profit - gross_loss, 2)
+
+    max_dd = rng.uniform(5, 40) * quality["risk_factor"]
+    drawdown = round(min(max_dd, 60), 2)
+
+    # ── Dates simulées ──
+    date_end = datetime.now()
+    tf_days = {"M1": 30, "M5": 60, "M15": 120, "M30": 180,
+               "H1": 365, "H4": 730, "D1": 1825}
+    days_back = tf_days.get(timeframe, 365)
+    date_start = date_end - timedelta(days=days_back)
+
+    return {
+        "profit": net_profit,
+        "drawdown": drawdown,
+        "trades": trades,
+        "winrate": round(winrate, 2),
+        "gross_profit": gross_profit,
+        "gross_loss": -gross_loss,
+        "initial_deposit": initial_deposit,
+        "symbol": symbol,
+        "data_source": "simulated",
+        "date_start": date_start.strftime("%Y-%m-%d"),
+        "date_end": date_end.strftime("%Y-%m-%d"),
+    }
+
+def _estimate_strategy_quality(
+    config: Dict[str, Any], is_full_strategy: bool, rng
+) -> Dict[str, float]:
+    """Estime des facteurs de qualité à partir des paramètres."""
+    quality_bonus = 0.0
+    trade_frequency = 1.0
+    reward_factor = 1.0
+    risk_factor = 1.0
+
+    if is_full_strategy:
+        indicators = config.get("indicators", [])
+        exit_logic = config.get("exit_logic", {})
+        risk_mgmt = config.get("risk_management", {})
+
+        if 2 <= len(indicators) <= 4:
+            quality_bonus += 0.2
+        elif len(indicators) > 4:
+            quality_bonus -= 0.1
+
+        exit_type = exit_logic.get("type", "")
+        if exit_type in ("atr_based", "trailing_stop"):
+            quality_bonus += 0.15
+            reward_factor *= 1.2
+
+        lot_size = risk_mgmt.get("lot_size", 0.1)
+        if lot_size > 0.3:
+            risk_factor *= 1.3
+        elif lot_size < 0.05:
+            reward_factor *= 0.7
+
+        max_risk = risk_mgmt.get("max_risk_percent", 2.0)
+        if max_risk > 3.0:
+            risk_factor *= 1.2
+        elif max_risk < 1.0:
+            quality_bonus += 0.1
+
+        tf = config.get("timeframe", "H1")
+        tf_freq = {
+            "M1": 3.0, "M5": 2.5, "M15": 2.0, "M30": 1.5,
+            "H1": 1.0, "H4": 0.6, "D1": 0.3,
+        }
+        trade_frequency = tf_freq.get(tf, 1.0)
+
+    quality_bonus += rng.gauss(0, 0.15)
+    quality_bonus = max(-0.5, min(1.0, quality_bonus))
+
+    return {
+        "quality_bonus": quality_bonus,
+        "trade_frequency": trade_frequency,
+        "reward_factor": reward_factor,
+        "risk_factor": risk_factor,
+    }
+
+
+def get_symbol_info(symbol: str = "EURUSD") -> Dict[str, Any]:
+    """Récupère les infos d'un symbole MT5."""
+    if not _ensure_connected():
+        return {"symbol": symbol, "error": "MT5 non connecté", "simulated": True}
+
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return {"symbol": symbol, "error": "Symbole non trouvé"}
+
+    return {
+        "symbol": symbol,
+        "bid": info.bid,
+        "ask": info.ask,
+        "spread": info.spread,
+        "digits": info.digits,
+        "trade_mode": info.trade_mode,
+    }
+
+
+def get_account_info() -> Dict[str, Any]:
+    """Récupère les infos du compte MT5."""
+    if not _ensure_connected():
+        return {"error": "MT5 non connecté", "simulated": True}
+
+    info = mt5.account_info()
+    if info is None:
+        return {"error": "Impossible de récupérer les infos compte"}
+
+    return {
+        "balance": info.balance,
+        "equity": info.equity,
+        "margin": info.margin,
+        "free_margin": info.margin_free,
+        "profit": info.profit,
+        "leverage": info.leverage,
+    }
