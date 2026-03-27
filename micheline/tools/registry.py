@@ -159,12 +159,16 @@ class ToolRegistry:
             try:
                 from micheline.tools.trading_tools import (
                     trading_search, trading_generate, run_backtest,
-                    generate_random_strategy, format_strategy_summary
+                    generate_random_strategy, format_strategy_summary,
+                    trading_quick_test, trading_improve,
+                    trading_report, trading_top_strategies
                 )
             except ImportError:
                 from tools.trading_tools import (
                     trading_search, trading_generate, run_backtest,
-                    generate_random_strategy, format_strategy_summary
+                    generate_random_strategy, format_strategy_summary,
+                    trading_quick_test, trading_improve,
+                    trading_report, trading_top_strategies
                 )
 
             self.register(
@@ -211,13 +215,57 @@ class ToolRegistry:
                 category="trading"
             )
 
-            logger.info("✅ Outils trading enregistrés")
+            # ═══════════════════════════════════════
+            # NOUVEAUX OUTILS TRADING
+            # ═══════════════════════════════════════
+
+            self.register(
+                name="trading_quick_test",
+                func=lambda p: self._safe_call(trading_quick_test, p),
+                description="Test rapide de N stratégies aléatoires",
+                parameters={
+                    "count": {"type": "integer", "required": False, "default": 5},
+                    "symbol": {"type": "string", "required": False, "default": "EURUSD"}
+                },
+                category="trading"
+            )
+
+            self.register(
+                name="trading_improve",
+                func=lambda p: self._safe_call(trading_improve, p),
+                description="Améliore une stratégie par mutations successives",
+                parameters={
+                    "iterations": {"type": "integer", "required": False, "default": 20},
+                    "mutation_strength": {"type": "float", "required": False, "default": 0.2}
+                },
+                category="trading"
+            )
+
+            self.register(
+                name="trading_report",
+                func=lambda p: self._safe_call(trading_report, p),
+                description="Rapport de la session de trading",
+                parameters={},
+                category="trading"
+            )
+
+            self.register(
+                name="trading_top_strategies",
+                func=lambda p: self._safe_call(trading_top_strategies, p),
+                description="Classement des meilleures stratégies",
+                parameters={
+                    "count": {"type": "integer", "required": False, "default": 5}
+                },
+                category="trading"
+            )
+
+            logger.info("✅ Outils trading enregistrés (8 outils)")
 
         except ImportError as e:
             logger.error(f"❌ Import trading tools échoué: {e}")
         except Exception as e:
             logger.error(f"❌ Erreur enregistrement trading: {e}", exc_info=True)
-
+            
     # ── FICHIERS ──
 
     def _register_file_tools(self):
