@@ -9,6 +9,8 @@ MichelineBridge avec support MULTI-ACTIONS :
 
 import logging
 import time
+import subprocess
+import os
 from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger("micheline.agent_bridge")
@@ -20,9 +22,110 @@ class AgentExecutor:
         self.llm_client = None
 
     def execute(self, tool_name: str, params: dict) -> Dict[str, Any]:
+        """Exécute un outil via le registry."""
         if self.registry is None:
             return {"success": False, "error": "Registry non initialisé"}
-        return self.registry.execute(tool_name, params)
+
+        # ═══════════════════════════════════════
+        # GESTION SPÉCIALE : app_launcher
+        # Le registry peut ne pas avoir cet outil,
+        # donc on le gère directement ici.
+        # ═══════════════════════════════════════
+        if tool_name == "app_launcher":
+            return self._execute_app_launcher(params)
+
+        try:
+            return self.registry.execute(tool_name, params)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _execute_app_launcher(self, params: dict) -> Dict[str, Any]:
+        """Lance une ou plusieurs applications."""
+        app_names = params.get("app_names", [])
+        if isinstance(app_names, str):
+            app_names = [app_names]
+
+        if not app_names:
+            return {"success": False, "error": "Aucune application spécifiée"}
+
+        # Mapping des noms courants vers les commandes Windows
+        APP_COMMANDS = {
+            "paint": "mspaint",
+            "peinture": "mspaint",
+            "mspaint": "mspaint",
+            "notepad": "notepad",
+            "bloc-notes": "notepad",
+            "bloc notes": "notepad",
+            "calculatrice": "calc",
+            "calculator": "calc",
+            "calc": "calc",
+            "cmd": "cmd",
+            "terminal": "cmd",
+            "powershell": "powershell",
+            "explorer": "explorer",
+            "explorateur": "explorer",
+            "chrome": "chrome",
+            "firefox": "firefox",
+            "edge": "msedge",
+            "word": "winword",
+            "excel": "excel",
+            "vscode": "code",
+            "code": "code",
+            "visual studio code": "code",
+            "discord": "discord",
+            "spotify": "spotify",
+            "steam": "steam",
+            "vlc": "vlc",
+            "obs": "obs64",
+            "teams": "teams",
+            "outlook": "outlook",
+            "gimp": "gimp",
+            "photoshop": "photoshop",
+            "snipping": "snippingtool",
+            "capture": "snippingtool",
+            "outil capture": "snippingtool",
+        }
+
+        results = []
+        all_success = True
+
+        for app_name in app_names:
+            app_lower = app_name.lower().strip()
+            command = APP_COMMANDS.get(app_lower, app_lower)
+
+            try:
+                # Essayer de lancer l'application
+                subprocess.Popen(
+                    command,
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                results.append(f"✅ {app_name} lancé")
+                logger.info(f"App lancée: {app_name} -> {command}")
+            except Exception as e1:
+                # Fallback : essayer avec start
+                try:
+                    subprocess.Popen(
+                        f'start "" "{command}"',
+                        shell=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    results.append(f"✅ {app_name} lancé")
+                    logger.info(f"App lancée (start): {app_name} -> {command}")
+                except Exception as e2:
+                    results.append(f"❌ Impossible de lancer {app_name}: {e2}")
+                    all_success = False
+                    logger.error(f"Échec lancement {app_name}: {e2}")
+
+        output = "\n".join(results)
+        return {
+            "success": all_success,
+            "output": output,
+            "formatted": output,
+            "message": output
+        }
 
 
 class AgentEvaluator:
@@ -34,12 +137,19 @@ class AgentEvaluator:
             return False, "Résultat invalide"
         if not result.get("success", False):
             return False, result.get("error", "Échec sans détail")
+
+        # App launcher → toujours complet si success
+        if tool_name == "app_launcher":
+            return True, "Application lancée"
+
+        # Trading → vérifier le score
         if tool_name in ("trading_search", "trading_generate"):
             score = result.get("best_score", 0)
             if score >= 15:
                 return True, f"Score acceptable: {score:.1f}"
             else:
                 return False, f"Score insuffisant: {score:.1f}"
+
         return True, "Résultat obtenu"
 
 
@@ -69,11 +179,21 @@ class MichelineBridge:
             from tools.registry import ToolRegistry
 
         self.tool_registry = ToolRegistry()
-        planner = Planner()
+        planner_instance = Planner()
+
+        # Passer le LLM au planner
+        if llm_client:
+            planner_instance.llm_client = llm_client
+            planner_instance.llm = llm_client
+
         executor = AgentExecutor(registry=self.tool_registry)
         evaluator = AgentEvaluator()
 
-        self.agent = AgentCore(planner=planner, executor=executor, evaluator=evaluator)
+        self.agent = AgentCore(
+            planner=planner_instance,
+            executor=executor,
+            evaluator=evaluator
+        )
         self.conversation_history = []
         self._initialized = False
         self._log("MichelineBridge créé")
@@ -211,14 +331,45 @@ class MichelineBridge:
                 last_error = "LLM direct échoué"
                 continue
 
-            # AUCUN OUTIL
+            # AUCUN OUTIL → ne pas boucler, essayer le fallback LLM
             if tool_name == "none":
-                last_error = "Aucun outil trouvé"
-                continue
+                self._log("   ⚠️ Aucun outil trouvé, tentative LLM direct...")
+                last_error = reasoning or "Aucun outil trouvé"
+
+                # Si c'est la première itération et qu'on a un LLM, essayer directement
+                if i == 0 and self.llm_client:
+                    llm_response = self._handle_llm_direct(
+                        f"L'utilisateur demande: {objective}\nRéponds de manière utile et concise."
+                    )
+                    if llm_response:
+                        # Re-planifier avec la réponse du LLM
+                        try:
+                            plan2 = self.agent.planner.create_plan(objective, llm_response)
+                            tool2 = plan2.get("tool", "none")
+                            if tool2 not in ("none", "conversation"):
+                                tool_name = tool2
+                                params = plan2.get("params", {})
+                                reasoning = plan2.get("reasoning", "")
+                                self._log(f"   🔄 Re-planifié: {tool_name}")
+                                # Continuer vers l'exécution ci-dessous
+                            elif tool2 == "conversation":
+                                response = plan2.get("params", {}).get("response", llm_response)
+                                return {"status": "success", "response": response, "iterations": iterations, "logs": logs}
+                            else:
+                                continue
+                        except Exception:
+                            continue
+                    else:
+                        continue
+                else:
+                    continue
 
             # EXÉCUTION
-            self._log("⚡ Exécution...")
-            result = self.agent.executor.execute(tool_name, params)
+            self._log(f"⚡ Exécution de {tool_name}...")
+            try:
+                result = self.agent.executor.execute(tool_name, params)
+            except Exception as e:
+                result = {"success": False, "error": str(e)}
 
             success = result and isinstance(result, dict) and result.get("success", False)
             self._log(f"   Succès : {success}")
@@ -257,7 +408,11 @@ class MichelineBridge:
                 # Fallback
                 if fallback and fallback != tool_name:
                     self._log(f"   🔄 Fallback: {fallback}")
-                    fb_result = self.agent.executor.execute(fallback, params)
+                    try:
+                        fb_result = self.agent.executor.execute(fallback, params)
+                    except Exception as e:
+                        fb_result = {"success": False, "error": str(e)}
+
                     if fb_result and isinstance(fb_result, dict) and fb_result.get("success"):
                         self.agent.planner.record_success(fallback)
                         response = self._format_response(fb_result, fallback)
@@ -266,7 +421,7 @@ class MichelineBridge:
 
                 self._log(f"   Évaluation : Échec de {tool_name}, réessai possible")
 
-        # ÉPUISÉ
+        # ÉPUISÉ — toutes les itérations utilisées
         if best_result:
             response = self._format_response(best_result, "partial")
             return {"status": "partial", "response": response, "iterations": iterations, "logs": logs}
@@ -296,6 +451,10 @@ class MichelineBridge:
                     system_prompt="Tu es Micheline, une IA locale.",
                     temperature=0.3, max_tokens=900
                 )
+            elif hasattr(self.llm_client, 'invoke'):
+                response = self.llm_client.invoke(prompt)
+            elif hasattr(self.llm_client, '__call__'):
+                response = self.llm_client(prompt)
             else:
                 return None
             return response.strip() if response and isinstance(response, str) else None
@@ -334,7 +493,11 @@ class MichelineBridge:
         return "\n".join(lines)
 
     def get_available_tools(self) -> List[str]:
+        if not self._initialized:
+            self.initialize()
         return self.tool_registry.list_tools()
 
     def get_tools_description(self) -> str:
+        if not self._initialized:
+            self.initialize()
         return self.tool_registry.get_tools_description()
