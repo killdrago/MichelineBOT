@@ -2,238 +2,121 @@
 micheline/trading/metrics.py
 
 Métriques d'évaluation des stratégies de trading.
-Inclut le scoring anti-overfitting (Phase 7).
+Score de 0 à 100. Adapté aux résultats avec capital réel.
 """
 
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any
 
-logger = logging.getLogger("micheline.metrics")
+logger = logging.getLogger("micheline.trading.metrics")
 
 
-def evaluate_strategy(result: dict) -> float:
+def evaluate_strategy(result: Dict[str, Any]) -> float:
     """
-    Évalue un résultat de backtest et retourne un score composite.
-    Score entre 0.0 (mauvais) et 100.0 (excellent).
-
-    Args:
-        result: dict avec keys: profit, drawdown, trades, winrate,
-                optionnellement: sharpe_ratio, profit_factor
-
-    Returns:
-        Score composite float
+    Évalue une stratégie et retourne un score de 0 à 100.
+    Prend en compte le capital réel si disponible.
     """
-    profit = result.get("profit", 0)
-    drawdown = result.get("drawdown", 0)
+    if not result or result.get("error"):
+        return 0.0
+
     trades = result.get("trades", 0)
-    winrate = result.get("winrate", 0)
-    sharpe = result.get("sharpe_ratio", 0)
-    profit_factor = result.get("profit_factor", 0)
+    if trades == 0:
+        return 0.0
 
-    # Composante profit (0-30 points)
-    profit_score = min(30.0, max(0.0, profit / 100.0))
+    profit_pips = result.get("profit", result.get("profit_pips", 0.0))
+    profit_money = result.get("profit_money", 0.0)
+    winrate = result.get("winrate", 0.0)
+    drawdown = result.get("drawdown", 0.0)
+    drawdown_pct = result.get("drawdown_pct", 0.0)
+    sharpe = result.get("sharpe_ratio", 0.0)
+    profit_factor = result.get("profit_factor", 0.0)
+    starting_capital = result.get("starting_capital", 10000)
+    ending_capital = result.get("ending_capital", 0)
 
-    # Composante drawdown (0-25 points) — moins c'est mieux
-    if drawdown <= 0:
-        dd_score = 25.0
-    elif drawdown < 5:
-        dd_score = 20.0
-    elif drawdown < 10:
-        dd_score = 15.0
-    elif drawdown < 20:
-        dd_score = 10.0
-    elif drawdown < 30:
-        dd_score = 5.0
+    score = 0.0
+
+    # ── Rendement (max 30 pts) ──
+    if starting_capital > 0 and ending_capital > 0:
+        pct_return = (ending_capital - starting_capital) / starting_capital * 100
+        if pct_return > 0:
+            profit_score = min(30.0, pct_return * 0.6)
+        else:
+            profit_score = max(-10.0, pct_return * 0.3)
     else:
-        dd_score = 0.0
+        if profit_pips > 0:
+            profit_score = min(30.0, profit_pips / 35.0)
+        else:
+            profit_score = max(-10.0, profit_pips / 50.0)
+    score += profit_score
 
-    # Composante winrate (0-20 points)
-    winrate_score = min(20.0, winrate * 20.0 / 0.6)  # 60% winrate = 20 pts
+    # ── Winrate (max 20 pts) ──
+    wr_score = min(20.0, winrate * 100.0 * 0.25)
+    score += wr_score
 
-    # Composante nombre de trades (0-10 points) — éviter trop peu
+    # ── Profit Factor (max 15 pts) ──
+    if profit_factor > 1.0:
+        pf_score = min(15.0, (profit_factor - 1.0) * 15.0)
+    elif profit_factor > 0:
+        pf_score = max(-5.0, (profit_factor - 1.0) * 10.0)
+    else:
+        pf_score = -5.0
+    score += pf_score
+
+    # ── Sharpe (max 15 pts) ──
+    if sharpe > 0:
+        sharpe_score = min(15.0, sharpe * 5.0)
+    else:
+        sharpe_score = max(-5.0, sharpe * 3.0)
+    score += sharpe_score
+
+    # ── Drawdown (pénalité max -15 pts) ──
+    if drawdown_pct > 0:
+        dd_penalty = min(15.0, drawdown_pct * 0.5)
+    elif drawdown > 0:
+        dd_penalty = min(15.0, drawdown / 35.0)
+    else:
+        dd_penalty = 0
+    score -= dd_penalty
+
+    # ── Nombre de trades (max 10 pts) ──
     if trades >= 100:
         trades_score = 10.0
     elif trades >= 50:
         trades_score = 7.0
-    elif trades >= 30:
+    elif trades >= 20:
         trades_score = 5.0
     elif trades >= 10:
         trades_score = 3.0
-    else:
+    elif trades >= 5:
         trades_score = 1.0
-
-    # Composante Sharpe (0-10 points)
-    sharpe_score = min(10.0, max(0.0, sharpe * 5.0))
-
-    # Composante profit factor (0-5 points)
-    pf_score = min(5.0, max(0.0, (profit_factor - 1.0) * 5.0)) if profit_factor > 0 else 0.0
-
-    total = profit_score + dd_score + winrate_score + trades_score + sharpe_score + pf_score
-
-    logger.debug(
-        f"Score breakdown: profit={profit_score:.1f}, dd={dd_score:.1f}, "
-        f"winrate={winrate_score:.1f}, trades={trades_score:.1f}, "
-        f"sharpe={sharpe_score:.1f}, pf={pf_score:.1f} → total={total:.1f}"
-    )
-
-    return round(total, 2)
-
-
-def compute_robustness_score(
-    train_score: float,
-    test_score: float,
-    oos_score: Optional[float] = None,
-    overfit_report: Optional[dict] = None
-) -> Dict[str, Any]:
-    """
-    Calcule un score de robustesse combinant performance et anti-overfitting.
-    
-    NOUVEAU — Phase 7
-    
-    Ce score est utilisé par l'optimizer pour décider si une stratégie
-    vaut la peine d'être gardée.
-    
-    Args:
-        train_score: Score sur données d'entraînement
-        test_score: Score sur données de test
-        oos_score: Score sur données OOS (optionnel)
-        overfit_report: Rapport d'OverfitDetector.to_dict() (optionnel)
-    
-    Returns:
-        Dict avec:
-            - robustness_score: float (0-100)
-            - adjusted_score: float (score final ajusté)
-            - penalty: float (pénalité appliquée)
-            - breakdown: dict des composantes
-    """
-    # Ratio de dégradation train → test
-    if train_score > 0:
-        degradation = test_score / train_score
     else:
-        degradation = 0.0
+        trades_score = -5.0
+    score += trades_score
 
-    # Pénalité pour overfitting
-    # Plus la dégradation est forte, plus la pénalité est élevée
-    if degradation >= 0.80:
-        overfit_penalty = 0.0  # Très bon : pas de pénalité
-    elif degradation >= 0.60:
-        overfit_penalty = 0.15  # Acceptable
-    elif degradation >= 0.40:
-        overfit_penalty = 0.35  # Suspect
-    else:
-        overfit_penalty = 0.60  # Overfitted
-
-    # Score de base = moyenne pondérée test (principal) et train (secondaire)
-    base_score = test_score * 0.7 + train_score * 0.3
-
-    # Bonus/malus OOS
-    oos_adjustment = 0.0
-    if oos_score is not None:
-        if oos_score >= test_score * 0.7:
-            oos_adjustment = 5.0  # Bonus : OOS confirme le test
-        elif oos_score >= test_score * 0.4:
-            oos_adjustment = 0.0  # Neutre
+    # ── Consistance train/test (max 10 pts) ──
+    tts = result.get("train_test_split", {})
+    if tts:
+        deg = tts.get("degradation_ratio", 1.0)
+        cons = tts.get("consistency_score", 1.0)
+        if deg >= 0.7 and cons >= 0.7:
+            score += 10.0
+        elif deg >= 0.4:
+            score += 5.0
+        elif deg > 0:
+            score += 0.0
         else:
-            oos_adjustment = -10.0  # Malus : OOS ne confirme pas
+            score -= 5.0
+    else:
+        # Bonus pour gain/perte moyen
+        avg_win = abs(result.get("avg_win", 0))
+        avg_loss = abs(result.get("avg_loss", 0))
+        if avg_loss > 0 and avg_win > 0:
+            ratio = avg_win / avg_loss
+            if ratio >= 2.0:
+                score += 10.0
+            elif ratio >= 1.5:
+                score += 7.0
+            elif ratio >= 1.0:
+                score += 4.0
 
-    # Bonus/malus du rapport anti-overfitting
-    report_adjustment = 0.0
-    if overfit_report:
-        verdict = overfit_report.get("verdict", "")
-        if verdict == "robust":
-            report_adjustment = 10.0
-        elif verdict == "suspect":
-            report_adjustment = -5.0
-        elif verdict == "overfitted":
-            report_adjustment = -20.0
-
-    # Score final
-    penalty = overfit_penalty * base_score
-    adjusted_score = base_score - penalty + oos_adjustment + report_adjustment
-    adjusted_score = max(0.0, min(100.0, adjusted_score))
-
-    # Score de robustesse (indépendant de la performance)
-    robustness = (degradation * 50) + (min(1.0, degradation) * 50)
-    if oos_score is not None and train_score > 0:
-        oos_ratio = min(1.0, oos_score / train_score)
-        robustness = robustness * 0.6 + oos_ratio * 100 * 0.4
-    robustness = max(0.0, min(100.0, robustness))
-
-    result = {
-        "robustness_score": round(robustness, 2),
-        "adjusted_score": round(adjusted_score, 2),
-        "penalty": round(penalty, 2),
-        "breakdown": {
-            "train_score": round(train_score, 2),
-            "test_score": round(test_score, 2),
-            "oos_score": round(oos_score, 2) if oos_score else None,
-            "degradation_ratio": round(degradation, 4),
-            "overfit_penalty": round(overfit_penalty, 4),
-            "oos_adjustment": round(oos_adjustment, 2),
-            "report_adjustment": round(report_adjustment, 2),
-            "base_score": round(base_score, 2)
-        }
-    }
-
-    logger.info(
-        f"Robustness: score={robustness:.1f}, adjusted={adjusted_score:.1f}, "
-        f"penalty={penalty:.1f}, degradation={degradation:.2f}"
-    )
-
-    return result
-
-
-def compute_sharpe_ratio(
-    trade_results: List[float],
-    risk_free_rate: float = 0.0,
-    periods_per_year: int = 252
-) -> float:
-    """
-    Calcule le ratio de Sharpe à partir des P&L des trades.
-    
-    NOUVEAU — Phase 7 (utilitaire pour les évaluations)
-    
-    Args:
-        trade_results: Liste des P&L de chaque trade
-        risk_free_rate: Taux sans risque annualisé (défaut 0)
-        periods_per_year: Nombre de périodes par an (252 jours de trading)
-    
-    Returns:
-        Sharpe ratio annualisé
-    """
-    if len(trade_results) < 2:
-        return 0.0
-
-    n = len(trade_results)
-    mean_return = sum(trade_results) / n
-    variance = sum((r - mean_return) ** 2 for r in trade_results) / (n - 1)
-    std_dev = variance ** 0.5
-
-    if std_dev == 0:
-        return 0.0
-
-    daily_sharpe = (mean_return - risk_free_rate / periods_per_year) / std_dev
-    annualized_sharpe = daily_sharpe * (periods_per_year ** 0.5)
-
-    return round(annualized_sharpe, 4)
-
-
-def compute_profit_factor(trade_results: List[float]) -> float:
-    """
-    Calcule le profit factor (gains bruts / pertes brutes).
-    
-    NOUVEAU — Phase 7
-    
-    Args:
-        trade_results: Liste des P&L de chaque trade
-    
-    Returns:
-        Profit factor (> 1.0 = profitable)
-    """
-    gross_profit = sum(t for t in trade_results if t > 0)
-    gross_loss = abs(sum(t for t in trade_results if t < 0))
-
-    if gross_loss == 0:
-        return float('inf') if gross_profit > 0 else 0.0
-
-    return round(gross_profit / gross_loss, 4)
+    return round(max(0.0, min(100.0, score)), 1)
